@@ -9,7 +9,17 @@ metadata:
 
 # NestJS Best Practices
 
-Comprehensive best practices guide for NestJS applications. Contains 40 rules across 10 categories, prioritized by impact to guide automated refactoring and code generation.
+Comprehensive best practices guide for NestJS applications. Contains 37 rules across 9 categories, prioritized by impact to guide automated refactoring and code generation.
+
+## Related Skills
+
+These skills own their topics; follow them over any overlapping example here:
+
+- `nestjs-fdd` - planning a feature or app as feature sets and Nest modules
+- `nestjs-setup` - versions, Node, ESM, SWC, Vitest configuration
+- `nestjs-testing` - unit tests with `useMocker()` auto-mocking, e2e tests with Supertest
+- `nestjs-typeorm` - TypeORM data source, migrations, transactions
+- `nestjs-resilience` - retries, timeouts, circuit breakers, idempotency, dead-letter handling
 
 ## When to Apply
 
@@ -31,11 +41,10 @@ Reference these guidelines when:
 | 3 | Error Handling | HIGH | `error-` |
 | 4 | Security | HIGH | `security-` |
 | 5 | Performance | HIGH | `perf-` |
-| 6 | Testing | MEDIUM-HIGH | `test-` |
-| 7 | Database & ORM | MEDIUM-HIGH | `db-` |
-| 8 | API Design | MEDIUM | `api-` |
-| 9 | Microservices | MEDIUM | `micro-` |
-| 10 | DevOps & Deployment | LOW-MEDIUM | `devops-` |
+| 6 | Database & ORM | MEDIUM-HIGH | `db-` |
+| 7 | API Design | MEDIUM | `api-` |
+| 8 | Microservices | MEDIUM | `micro-` |
+| 9 | DevOps & Deployment | LOW-MEDIUM | `devops-` |
 
 ## Quick Reference
 
@@ -78,32 +87,26 @@ Reference these guidelines when:
 - `perf-optimize-database` - Optimize database queries
 - `perf-lazy-loading` - Lazy load modules for faster startup
 
-### 6. Testing (MEDIUM-HIGH)
-
-- `test-use-testing-module` - Use NestJS testing utilities
-- `test-e2e-supertest` - E2E testing with Supertest
-- `test-mock-external-services` - Mock external dependencies
-
-### 7. Database & ORM (MEDIUM-HIGH)
+### 6. Database & ORM (MEDIUM-HIGH)
 
 - `db-use-transactions` - Transaction management
 - `db-avoid-n-plus-one` - Avoid N+1 query problems
 - `db-use-migrations` - Use migrations for schema changes
 
-### 8. API Design (MEDIUM)
+### 7. API Design (MEDIUM)
 
 - `api-use-dto-serialization` - DTO and response serialization
 - `api-use-interceptors` - Cross-cutting concerns
 - `api-versioning` - API versioning strategies
 - `api-use-pipes` - Input transformation with pipes
 
-### 9. Microservices (MEDIUM)
+### 8. Microservices (MEDIUM)
 
 - `micro-use-patterns` - Message and event patterns
 - `micro-use-health-checks` - Health checks for orchestration
 - `micro-use-queues` - Background job processing
 
-### 10. DevOps & Deployment (LOW-MEDIUM)
+### 9. DevOps & Deployment (LOW-MEDIUM)
 
 - `devops-use-config-module` - Environment configuration
 - `devops-use-logging` - Structured logging
@@ -128,4 +131,4 @@ Each rule file contains:
 ## Full Compiled Document
 
 For the complete guide with all rules expanded in a single document, see
-[AGENTS.md in the repository](https://github.com/Kadajett/agent-nestjs-skills/blob/main/AGENTS.md).
+[compiled/nestjs-best-practices.md in the repository](https://github.com/Ansaal/agent-nestjs-skills/blob/main/compiled/nestjs-best-practices.md).

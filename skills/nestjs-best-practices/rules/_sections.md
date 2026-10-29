@@ -30,27 +30,22 @@ The section ID (in parentheses) is the filename prefix used to group rules.
 **Impact:** HIGH
 **Description:** Optimizing request handling, caching, and database queries directly impacts application responsiveness and scalability.
 
-## 6. Testing (test)
-
-**Impact:** MEDIUM-HIGH
-**Description:** Well-tested applications are more reliable. NestJS testing utilities enable comprehensive unit and e2e coverage.
-
-## 7. Database & ORM (db)
+## 6. Database & ORM (db)
 
 **Impact:** MEDIUM-HIGH
 **Description:** Proper database access patterns, transactions, and query optimization are crucial for data-intensive applications.
 
-## 8. API Design (api)
+## 7. API Design (api)
 
 **Impact:** MEDIUM
 **Description:** RESTful conventions, versioning, DTOs, and consistent response formats improve API usability and maintainability.
 
-## 9. Microservices (micro)
+## 8. Microservices (micro)
 
 **Impact:** MEDIUM
 **Description:** Building distributed systems requires understanding message patterns, health checks, and inter-service communication.
 
-## 10. DevOps & Deployment (devops)
+## 9. DevOps & Deployment (devops)
 
 **Impact:** LOW-MEDIUM
 **Description:** Configuration management, structured logging, and graceful shutdown ensure production readiness and zero-downtime deployments.

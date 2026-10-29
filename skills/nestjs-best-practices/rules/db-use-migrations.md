@@ -7,7 +7,7 @@ tags: database, migrations, typeorm, schema
 
 ## Use Database Migrations
 
-Never use `synchronize: true` in production. Use migrations for all schema changes. Migrations provide version control for your database, enable safe rollbacks, and ensure consistency across all environments.
+Use migrations for every schema change, in every environment, including tests: keep `synchronize: false` everywhere so the schema your tests run against is the one your migrations produce. Migrations provide version control for your database, enable safe rollbacks, and ensure consistency across all environments. The wiring (one `data-source.ts` shared by the CLI and Nest, migration classes listed explicitly, the CLI runner for ESM projects) is in the `nestjs-typeorm` skill; this rule covers what a migration should contain.
 
 **Incorrect (using synchronize or manual SQL):**
 
@@ -42,32 +42,8 @@ export class User {
 **Correct (use migrations for all schema changes):**
 
 ```typescript
-// Configure TypeORM for migrations
-// data-source.ts
-export const dataSource = new DataSource({
-  type: 'postgres',
-  host: process.env.DB_HOST,
-  port: parseInt(process.env.DB_PORT),
-  username: process.env.DB_USERNAME,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  entities: ['dist/**/*.entity.js'],
-  migrations: ['dist/migrations/*.js'],
-  synchronize: false, // Always false in production
-  migrationsRun: true, // Run migrations on startup
-});
-
-// app.module.ts
-TypeOrmModule.forRootAsync({
-  inject: [ConfigService],
-  useFactory: (config: ConfigService) => ({
-    type: 'postgres',
-    host: config.get('DB_HOST'),
-    synchronize: config.get('NODE_ENV') === 'development', // Only in dev
-    migrations: ['dist/migrations/*.js'],
-    migrationsRun: true,
-  }),
-});
+// Wiring: see nestjs-typeorm (data-source.ts, CLI, migrations listed as classes).
+// Always: synchronize: false, migrationsRun: true.
 
 // migrations/1705312800000-AddUserAge.ts
 import { MigrationInterface, QueryRunner } from 'typeorm';
@@ -126,4 +102,4 @@ export class RenameNameToFullName1705312900000 implements MigrationInterface {
 }
 ```
 
-Reference: [TypeORM Migrations](https://typeorm.io/migrations)
+Reference: [TypeORM Migrations](https://typeorm.io/docs/advanced-topics/migrations/)

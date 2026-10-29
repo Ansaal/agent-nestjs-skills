@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Build script for generating AGENTS.md
+# Build script for generating compiled/<skill>.md for every rule-based skill
 # Usage: ./build.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

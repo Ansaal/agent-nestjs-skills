@@ -1,15 +1,17 @@
 #!/usr/bin/env npx ts-node
 
 /**
- * Build script for generating AGENTS.md from individual rule files
+ * Build script for generating compiled/<skill>.md for every skill with a rules/ directory
  *
  * Usage: npx ts-node scripts/build-agents.ts
  *
- * This script:
- * 1. Reads all rule files from the rules/ directory
- * 2. Parses YAML frontmatter for metadata
- * 3. Groups rules by category based on filename prefix
- * 4. Generates a consolidated AGENTS.md file
+ * For each skills/<skill>/rules/ directory, this script:
+ * 1. Reads the sections (prefix, name, impact) from rules/_sections.md
+ * 2. Parses YAML frontmatter of every rule file
+ * 3. Groups rules by section based on filename prefix
+ * 4. Generates a consolidated compiled/<skill>.md file
+ *
+ * A rule without frontmatter or with an undeclared prefix fails the build.
  */
 
 import * as fs from 'fs';
@@ -20,19 +22,19 @@ import { dirname } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Category definitions with ordering and metadata
-const CATEGORIES = [
-  { prefix: 'arch-', name: 'Architecture', impact: 'CRITICAL', section: 1 },
-  { prefix: 'di-', name: 'Dependency Injection', impact: 'CRITICAL', section: 2 },
-  { prefix: 'error-', name: 'Error Handling', impact: 'HIGH', section: 3 },
-  { prefix: 'security-', name: 'Security', impact: 'HIGH', section: 4 },
-  { prefix: 'perf-', name: 'Performance', impact: 'HIGH', section: 5 },
-  { prefix: 'test-', name: 'Testing', impact: 'MEDIUM-HIGH', section: 6 },
-  { prefix: 'db-', name: 'Database & ORM', impact: 'MEDIUM-HIGH', section: 7 },
-  { prefix: 'api-', name: 'API Design', impact: 'MEDIUM', section: 8 },
-  { prefix: 'micro-', name: 'Microservices', impact: 'MEDIUM', section: 9 },
-  { prefix: 'devops-', name: 'DevOps & Deployment', impact: 'LOW-MEDIUM', section: 10 },
-];
+interface Category {
+  prefix: string;
+  name: string;
+  impact: string;
+  section: number;
+}
+
+interface Skill {
+  name: string;
+  title: string;
+  abstract: string;
+  rulesDir: string;
+}
 
 interface RuleFrontmatter {
   title: string;
@@ -102,22 +104,55 @@ function parseFrontmatter(content: string): { frontmatter: RuleFrontmatter | nul
   };
 }
 
-function getCategoryForFile(filename: string): { name: string; section: number } | null {
-  for (const cat of CATEGORIES) {
-    if (filename.startsWith(cat.prefix)) {
-      return { name: cat.name, section: cat.section };
-    }
+/** Sections are declared in rules/_sections.md as `## <n>. <Name> (<prefix>)` followed by `**Impact:** <level>`. */
+function readCategories(rulesDir: string): Category[] {
+  const content = fs.readFileSync(path.join(rulesDir, '_sections.md'), 'utf-8');
+  const sectionRegex = /^## (\d+)\. (.+?) \(([a-z0-9]+)\)\s*\n+\*\*Impact:\*\* (.+)$/gm;
+  const categories: Category[] = [];
+  for (const match of content.matchAll(sectionRegex)) {
+    categories.push({
+      section: Number(match[1]),
+      name: match[2],
+      prefix: `${match[3]}-`,
+      impact: match[4].trim(),
+    });
   }
-  return null;
+  if (categories.length === 0) {
+    throw new Error(`No sections found in ${path.join(rulesDir, '_sections.md')}`);
+  }
+  return categories.sort((a, b) => a.section - b.section);
 }
 
-function readMetadata(): any {
+interface Metadata {
+  version: string;
+  organization: string;
+  date: string;
+  references: string[];
+}
+
+function readMetadata(): Metadata {
   const metadataPath = path.join(__dirname, '..', 'metadata.json');
-  return JSON.parse(fs.readFileSync(metadataPath, 'utf-8'));
+  // Repository-owned file, edited by maintainers alongside this script.
+  return JSON.parse(fs.readFileSync(metadataPath, 'utf-8')) as Metadata;
 }
 
-function readRules(): Rule[] {
-  const rulesDir = path.join(__dirname, '..', 'skills', 'nestjs-best-practices', 'rules');
+function readSkills(): Skill[] {
+  const skillsDir = path.join(__dirname, '..', 'skills');
+  return fs.readdirSync(skillsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(skillsDir, entry.name, 'rules')))
+    .map((entry) => {
+      const skillMd = fs.readFileSync(path.join(skillsDir, entry.name, 'SKILL.md'), 'utf-8');
+      const title = skillMd.match(/^# (.+)$/m)?.[1];
+      const abstract = skillMd.match(/^description: (.+)$/m)?.[1];
+      if (!title || !abstract) {
+        throw new Error(`skills/${entry.name}/SKILL.md needs a "# " title and a "description:" frontmatter line`);
+      }
+      return { name: entry.name, title, abstract, rulesDir: path.join(skillsDir, entry.name, 'rules') };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function readRules(rulesDir: string, categories: Category[]): Rule[] {
   const files = fs.readdirSync(rulesDir)
     .filter(f => f.endsWith('.md') && !f.startsWith('_'));
 
@@ -129,14 +164,12 @@ function readRules(): Rule[] {
     const { frontmatter, body } = parseFrontmatter(content);
 
     if (!frontmatter) {
-      console.warn(`Warning: No frontmatter found in ${file}`);
-      continue;
+      throw new Error(`No frontmatter found in ${filePath}`);
     }
 
-    const category = getCategoryForFile(file);
+    const category = categories.find((cat) => file.startsWith(cat.prefix));
     if (!category) {
-      console.warn(`Warning: Unknown category for ${file}`);
-      continue;
+      throw new Error(`Prefix of ${filePath} is not declared in _sections.md`);
     }
 
     rules.push({
@@ -151,10 +184,10 @@ function readRules(): Rule[] {
   return rules;
 }
 
-function generateTableOfContents(rulesByCategory: Map<string, Rule[]>): string {
+function generateTableOfContents(rulesByCategory: Map<string, Rule[]>, categories: Category[]): string {
   let toc = '## Table of Contents\n\n';
 
-  for (const cat of CATEGORIES) {
+  for (const cat of categories) {
     const rules = rulesByCategory.get(cat.name);
     if (!rules || rules.length === 0) continue;
 
@@ -174,7 +207,7 @@ function generateTableOfContents(rulesByCategory: Map<string, Rule[]>): string {
   return toc;
 }
 
-function generateAgentsMd(rules: Rule[], metadata: any): string {
+function generateAgentsMd(skill: Skill, rules: Rule[], categories: Category[], metadata: Metadata): string {
   // Group rules by category
   const rulesByCategory = new Map<string, Rule[]>();
 
@@ -191,7 +224,7 @@ function generateAgentsMd(rules: Rule[], metadata: any): string {
   }
 
   // Build document
-  let doc = `# NestJS Best Practices
+  let doc = `# ${skill.title}
 
 **Version ${metadata.version}**
 ${metadata.organization}
@@ -207,18 +240,18 @@ ${metadata.date}
 
 ## Abstract
 
-${metadata.abstract}
+${skill.abstract}
 
 ---
 
 `;
 
   // Add table of contents
-  doc += generateTableOfContents(rulesByCategory);
+  doc += generateTableOfContents(rulesByCategory, categories);
   doc += '\n---\n\n';
 
   // Add rules by category
-  for (const cat of CATEGORIES) {
+  for (const cat of categories) {
     const categoryRules = rulesByCategory.get(cat.name);
     if (!categoryRules || categoryRules.length === 0) continue;
 
@@ -263,37 +296,27 @@ ${metadata.abstract}
 }
 
 function main() {
-  console.log('Building AGENTS.md...\n');
-
   const metadata = readMetadata();
-  console.log(`Version: ${metadata.version}`);
-  console.log(`Organization: ${metadata.organization}\n`);
+  console.log(`Version: ${metadata.version}\n`);
 
-  const rules = readRules();
-  console.log(`Found ${rules.length} rules\n`);
+  for (const skill of readSkills()) {
+    const categories = readCategories(skill.rulesDir);
+    const rules = readRules(skill.rulesDir, categories);
 
-  // Count by category
-  const counts = new Map<string, number>();
-  for (const rule of rules) {
-    counts.set(rule.category, (counts.get(rule.category) || 0) + 1);
-  }
-
-  console.log('Rules by category:');
-  for (const cat of CATEGORIES) {
-    const count = counts.get(cat.name) || 0;
-    if (count > 0) {
-      console.log(`  ${cat.name}: ${count}`);
+    console.log(`${skill.name}: ${rules.length} rules`);
+    for (const cat of categories) {
+      const count = rules.filter((rule) => rule.category === cat.name).length;
+      if (count > 0) {
+        console.log(`  ${cat.name}: ${count}`);
+      }
     }
+
+    const compiled = generateAgentsMd(skill, rules, categories, metadata);
+    const outputPath = path.join(__dirname, '..', 'compiled', `${skill.name}.md`);
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, compiled);
+    console.log(`  → compiled/${skill.name}.md (${compiled.length} bytes)\n`);
   }
-  console.log('');
-
-  const agentsMd = generateAgentsMd(rules, metadata);
-
-  const outputPath = path.join(__dirname, '..', 'AGENTS.md');
-  fs.writeFileSync(outputPath, agentsMd);
-
-  console.log(`Generated AGENTS.md (${agentsMd.length} bytes)`);
-  console.log(`Output: ${outputPath}`);
 }
 
 main();

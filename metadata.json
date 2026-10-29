@@ -1,8 +1,12 @@
 {
-  "version": "1.2.0",
-  "organization": "NestJS Best Practices",
-  "date": "January 2026",
-  "abstract": "Comprehensive best practices and architecture guide for NestJS applications, designed for AI agents and LLMs. Contains 40 rules across 10 categories, prioritized by impact from critical (architecture, dependency injection) to incremental (DevOps patterns). Each rule includes detailed explanations, real-world examples comparing incorrect vs. correct implementations, and specific impact metrics to guide automated refactoring and code generation.",
+  "version": "2.0.0-ansaal",
+  "forkedFrom": {
+    "repository": "https://github.com/Kadajett/agent-nestjs-skills",
+    "version": "1.2.0",
+    "commit": "3986e0c"
+  },
+  "organization": "Ansaal/agent-nestjs-skills",
+  "date": "October 2026",
   "references": [
     "https://docs.nestjs.com",
     "https://github.com/nestjs/nest",

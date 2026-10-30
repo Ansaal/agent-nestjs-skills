@@ -7,196 +7,170 @@ tags: api, interceptors, logging, caching
 
 ## Use Interceptors for Cross-Cutting Concerns
 
-Interceptors can transform responses, add logging, handle caching, and measure performance without polluting your business logic. They wrap the route handler execution, giving you access to both the request and response streams.
+Interceptors wrap handler execution, so tracing, response envelopes, timeouts, caching and error mapping live in one place instead of every handler. Register global ones as `APP_INTERCEPTOR` providers so e2e apps built from `AppModule` get them too (`nestjs-testing` rule `e2e-global-enhancers-as-providers`). Async work started inside the pipe (a cache write) must be awaited and its failure handled; a rejected promise nobody awaits is an unhandled rejection. Log levels and call shape: `nestjs-logging`.
 
-**Incorrect (logging and transformation in every method):**
+**Incorrect (repeated per handler; unawaited cache write; message matching):**
 
 ```typescript
-// Logging in every controller method
-@Controller('users')
-export class UsersController {
-  @Get()
-  async findAll(): Promise<User[]> {
-    const start = Date.now();
-    this.logger.log('findAll called');
-
-    const users = await this.usersService.findAll();
-
-    this.logger.log(`findAll completed in ${Date.now() - start}ms`);
-    return users;
-  }
-
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<User> {
-    const start = Date.now();
-    this.logger.log(`findOne called with id: ${id}`);
-
-    const user = await this.usersService.findOne(id);
-
-    this.logger.log(`findOne completed in ${Date.now() - start}ms`);
-    return user;
-  }
-  // Repeated in every method!
+@Get(':id')
+async findOne(@Param('id') id: string): Promise<User> {
+  const start = Date.now();
+  this.logger.debug('findOne called', { id });
+  const user = await this.usersService.findOne(id);
+  this.logger.debug('findOne completed', { durationMs: Date.now() - start });
+  return user; // repeated in every method
 }
 
-// Manual response wrapping
-@Get()
-async findAll(): Promise<{ data: User[]; meta: Meta }> {
-  const users = await this.usersService.findAll();
-  return {
-    data: users,
-    meta: { timestamp: new Date(), count: users.length },
-  };
+const cached = await this.cacheManager.get(cacheKey);
+if (cached) return of(cached); // false, 0 and '' are recomputed every time
+return next.handle().pipe(
+  tap((response) => {
+    this.cacheManager.set(cacheKey, response, ttl); // not awaited: a failing store is an unhandled rejection
+  }),
+);
+
+if (error instanceof QueryFailedError && error.message.includes('duplicate')) {
+  throw new ConflictException(); // driver- and locale-specific; better-sqlite3 says "UNIQUE constraint failed"
 }
 ```
 
-**Correct (use interceptors for cross-cutting concerns):**
+**Correct (`common/interceptors.ts`):**
 
 ```typescript
-// Logging interceptor
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import {
+  ConflictException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+  RequestTimeoutException,
+  type CallHandler,
+  type ExecutionContext,
+  type NestInterceptor,
+} from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import type { Cache } from 'cache-manager';
+import type { Request, Response } from 'express';
+import { catchError, map, mergeMap, of, tap, throwError, timeout, TimeoutError, type Observable } from 'rxjs';
+import { EntityNotFoundError } from 'typeorm';
+import { isUniqueViolation } from '../database/is-unique-violation.js';
+
 @Injectable()
 export class LoggingInterceptor implements NestInterceptor {
-  private readonly logger = new Logger('HTTP');
+  private readonly logger = new Logger(LoggingInterceptor.name);
 
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
-    const request = context.switchToHttp().getRequest();
-    const { method, url, body } = request;
-    const now = Date.now();
-
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const { method, url } = context.switchToHttp().getRequest<Request>();
+    const start = Date.now();
+    // Per-request tracing at debug, values as fields. Failures are logged once, by the exception filter.
     return next.handle().pipe(
-      tap({
-        next: (data) => {
-          const response = context.switchToHttp().getResponse();
-          this.logger.log(
-            `${method} ${url} ${response.statusCode} - ${Date.now() - now}ms`,
-          );
-        },
-        error: (error) => {
-          this.logger.error(
-            `${method} ${url} ${error.status || 500} - ${Date.now() - now}ms`,
-            error.stack,
-          );
-        },
+      tap(() => {
+        const { statusCode } = context.switchToHttp().getResponse<Response>();
+        this.logger.debug('Request handled', { method, url, statusCode, durationMs: Date.now() - start });
       }),
     );
   }
 }
 
-// Response transformation interceptor
+export interface Envelope<T> {
+  data: T;
+  meta: { timestamp: string; path: string };
+}
+
 @Injectable()
-export class TransformInterceptor<T> implements NestInterceptor<T, Response<T>> {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<Response<T>> {
+export class EnvelopeInterceptor<T> implements NestInterceptor<T, Envelope<T>> {
+  intercept(context: ExecutionContext, next: CallHandler<T>): Observable<Envelope<T>> {
+    const path = context.switchToHttp().getRequest<Request>().url;
     return next.handle().pipe(
-      map((data) => ({
-        data,
-        meta: {
-          timestamp: new Date().toISOString(),
-          path: context.switchToHttp().getRequest().url,
-        },
-      })),
+      map((data) => ({ data, meta: { timestamp: new Date().toISOString(), path } })),
     );
   }
 }
 
-// Timeout interceptor
 @Injectable()
 export class TimeoutInterceptor implements NestInterceptor {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+  intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
     return next.handle().pipe(
       timeout(5000),
-      catchError((err) => {
-        if (err instanceof TimeoutError) {
-          throw new RequestTimeoutException('Request timed out');
+      catchError((err: unknown) =>
+        throwError(() => (err instanceof TimeoutError ? new RequestTimeoutException('Request timed out') : err)),
+      ),
+    );
+  }
+}
+
+/** TTL in milliseconds for HttpCacheInterceptor; the route's default applies without it. */
+export const CacheTtl = Reflector.createDecorator<number>();
+
+@Injectable()
+export class HttpCacheInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(HttpCacheInterceptor.name);
+
+  constructor(
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly reflector: Reflector,
+  ) {}
+
+  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<unknown>> {
+    const request = context.switchToHttp().getRequest<Request>();
+    if (request.method !== 'GET') return next.handle();
+
+    const key = `http:${request.originalUrl}`; // path + query string; never for per-user responses
+    const ttl = this.reflector.get(CacheTtl, context.getHandler()) ?? 300_000;
+
+    const cached = await this.cache.get<unknown>(key);
+    if (cached !== undefined) return of(cached); // false, 0 and '' are hits too
+
+    return next.handle().pipe(
+      mergeMap(async (response: unknown) => {
+        try {
+          await this.cache.set(key, response, ttl);
+        } catch (error) {
+          // Best effort: the response is still correct, only the next request is slower
+          const err = error instanceof Error ? error : new Error(String(error));
+          this.logger.warn('Cache write failed', { key }, err);
         }
-        throw err;
+        return response;
       }),
     );
   }
 }
 
-// Apply globally or per-controller
+/** Maps persistence errors the handler didn't handle to HTTP errors. */
+@Injectable()
+export class PersistenceErrorInterceptor implements NestInterceptor {
+  intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    return next.handle().pipe(
+      catchError((error: unknown) => {
+        if (error instanceof EntityNotFoundError) return throwError(() => new NotFoundException());
+        if (isUniqueViolation(error)) return throwError(() => new ConflictException('Resource already exists'));
+        return throwError(() => error);
+      }),
+    );
+  }
+}
+```
+
+```typescript
+// app.module.ts — global; per controller or route with @UseInterceptors(...)
 @Module({
   providers: [
     { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
-    { provide: APP_INTERCEPTOR, useClass: TransformInterceptor },
+    { provide: APP_INTERCEPTOR, useClass: EnvelopeInterceptor },
   ],
 })
 export class AppModule {}
 
-// Or per-controller
-@Controller('users')
-@UseInterceptors(LoggingInterceptor)
-export class UsersController {
-  @Get()
-  async findAll(): Promise<User[]> {
-    // Clean business logic only
-    return this.usersService.findAll();
-  }
-}
-
-// Custom cache interceptor with TTL
-@Injectable()
-export class HttpCacheInterceptor implements NestInterceptor {
-  constructor(
-    private cacheManager: Cache,
-    private reflector: Reflector,
-  ) {}
-
-  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<any>> {
-    const request = context.switchToHttp().getRequest();
-
-    // Only cache GET requests
-    if (request.method !== 'GET') {
-      return next.handle();
-    }
-
-    const cacheKey = this.generateKey(request);
-    const ttl = this.reflector.get<number>('cacheTTL', context.getHandler()) || 300;
-
-    const cached = await this.cacheManager.get(cacheKey);
-    if (cached) {
-      return of(cached);
-    }
-
-    return next.handle().pipe(
-      tap((response) => {
-        this.cacheManager.set(cacheKey, response, ttl);
-      }),
-    );
-  }
-
-  private generateKey(request: Request): string {
-    return `cache:${request.url}:${JSON.stringify(request.query)}`;
-  }
-}
-
-// Usage with custom TTL
-@Get()
-@SetMetadata('cacheTTL', 600)
+// usage
+@Get('flags/:name')
+@CacheTtl(60_000)
 @UseInterceptors(HttpCacheInterceptor)
-async findAll(): Promise<User[]> {
-  return this.usersService.findAll();
-}
-
-// Error mapping interceptor
-@Injectable()
-export class ErrorMappingInterceptor implements NestInterceptor {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
-    return next.handle().pipe(
-      catchError((error) => {
-        if (error instanceof EntityNotFoundError) {
-          throw new NotFoundException(error.message);
-        }
-        if (error instanceof QueryFailedError) {
-          if (error.message.includes('duplicate')) {
-            throw new ConflictException('Resource already exists');
-          }
-        }
-        throw error;
-      }),
-    );
-  }
+isEnabled(@Param('name') name: string): Promise<boolean> {
+  return this.flags.isEnabled(name);
 }
 ```
+
+In the probe, a route returning `false` behind `HttpCacheInterceptor` ran once for two requests. With a cache store whose `set()` rejects, the request still returned 200 and the interceptor logged `warn('Cache write failed', { key: 'http:/skus/flag' }, Error('redis down'))`. Inserting a second row with the same `unique` code through `TransactionRunner` returned `409 {"message":"Resource already exists",…}`, and `findOneByOrFail` for a missing id returned `404` without echoing the query criteria that `EntityNotFoundError.message` contains. `isUniqueViolation` is the helper from `nestjs-typeorm` rule `orm-unique-violation`; when a service needs a different answer for a duplicate (return the existing row, `'duplicate'`), it catches there and the interceptor never sees it. The cache key is URL-only, so the interceptor is for responses that are the same for every caller; per-user keys and the stock `CacheInterceptor` are in `perf-use-caching`.
 
 Reference: [NestJS Interceptors](https://docs.nestjs.com/interceptors)

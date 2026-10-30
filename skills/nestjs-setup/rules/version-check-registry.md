@@ -20,6 +20,7 @@ pnpm add -D jest ts-jest @types/jest typescript           # typescript@latest is
 
 ```bash
 node -v                                              # see version-pin-node
+npm view pnpm version                                # 12.16.1; pinned in packageManager (version-pin-node)
 npm view @nestjs/core version                        # 12.3.2 on 2026-10-29
 npm view @nestjs/cli engines dependencies.typescript
 npm view @nestjs/schematics engines peerDependencies
@@ -40,6 +41,7 @@ Snapshot, verified 2026-10-29:
 | `typescript` | 6.0.3 | `latest` is 7.0.2; install `^6` so `tsc` matches the CLI's checker |
 | `vitest` | 5.0.5 | engines `^22.12.0 \|\| ^24.0.0 \|\| >=26.0.0` |
 | `@swc/core`, `@swc/cli`, `unplugin-swc` | 1.16.20, 0.8.2, 2.0.0 | |
+| `pnpm` | 12.16.1 | exact version in `packageManager`; bump it on purpose, with the reinstalled lockfile in the same change |
 
 When `npm view @nestjs/core version` reports a major above 12, read the migration guide first; treat this snapshot and every rule in this skill as possibly stale until the guide confirms them.
 

@@ -43,39 +43,38 @@ export class UsersController {
 // Throw exceptions directly from service
 @Injectable()
 export class UsersService {
-  constructor(private readonly repo: UserRepository) {}
+  constructor(private readonly usersRepo: UsersRepository) {}
 
   async findById(id: string): Promise<User> {
-    const user = await this.repo.findOne({ where: { id } });
-    if (!user) {
-      throw new NotFoundException(`User #${id} not found`);
-    }
+    const user = await this.usersRepo.findById(id);
+    if (!user) throw new NotFoundException('User not found'); // no client input echoed (security-sanitize-output)
     return user;
   }
 
   async create(dto: CreateUserDto): Promise<User> {
-    const existing = await this.repo.findOne({
-      where: { email: dto.email },
-    });
-    if (existing) {
-      throw new ConflictException('Email already registered');
+    try {
+      return await this.usersRepo.insert({ email: dto.email, name: dto.name });
+    } catch (error) {
+      if (isUniqueViolation(error)) throw new ConflictException('Email already registered');
+      throw error;
     }
-    return this.repo.save(dto);
   }
 
   async update(id: string, dto: UpdateUserDto): Promise<User> {
-    const user = await this.findById(id); // Throws if not found
-    Object.assign(user, dto);
-    return this.repo.save(user);
+    const user = await this.usersRepo.update(id, dto); // null when no row matched
+    if (!user) throw new NotFoundException('User not found');
+    return user;
   }
 }
 
 // Controller stays thin
 @Controller('users')
 export class UsersController {
+  constructor(private readonly usersService: UsersService) {}
+
   @Get(':id')
-  findOne(@Param('id') id: string): Promise<User> {
-    return this.usersService.findById(id);
+  findOne(@Param() params: UserIdParamDto): Promise<User> {
+    return this.usersService.findById(params.id);
   }
 
   @Post()
@@ -87,28 +86,22 @@ export class UsersController {
 // For layer-agnostic services, use domain exceptions
 export class EntityNotFoundException extends Error {
   constructor(
-    public readonly entity: string,
-    public readonly id: string,
+    readonly entity: string,
+    readonly id: string,
   ) {
-    super(`${entity} with ID "${id}" not found`);
+    super(`${entity} not found`);
   }
 }
 
-// Map to HTTP in exception filter
+// Map to HTTP in an exception filter (error-use-exception-filters)
 @Catch(EntityNotFoundException)
-export class EntityNotFoundFilter implements ExceptionFilter {
-  catch(exception: EntityNotFoundException, host: ArgumentsHost) {
-    const ctx = host.switchToHttp();
-    const response = ctx.getResponse<Response>();
-
-    response.status(404).json({
-      statusCode: 404,
-      message: exception.message,
-      entity: exception.entity,
-      id: exception.id,
-    });
+export class EntityNotFoundFilter extends BaseExceptionFilter {
+  override catch(exception: EntityNotFoundException, host: ArgumentsHost): void {
+    super.catch(new NotFoundException(exception.message, { cause: exception }), host);
   }
 }
 ```
+
+`UsersRepository` writes through `TransactionRunner` (`arch-use-repository-pattern`); the duplicate check is the unique index, not a pre-read (`nestjs-typeorm` rule `orm-unique-violation`). In the probe a duplicate email answered `409 {"message":"Email already registered","error":"Conflict","statusCode":409}` and `PATCH` on an unknown id answered 404.
 
 Reference: [NestJS Exception Filters](https://docs.nestjs.com/exception-filters)

@@ -9,9 +9,9 @@ metadata:
 
 # NestJS Resilience
 
-How a Nest app calls slow or failing dependencies: one `@nestjs/resilience` preset per dependency, decorators on entrypoints, policy objects in services, a dead-letter record for every call that exhausts its retries, downstream calls dispatched after commit, and the right deduplication for each kind of duplicate request. Verified 2026-10-29 against NestJS 12.3.2, @nestjs/resilience 0.0.3, @nestjs/idempotency 0.0.3, TypeORM 1.1.2 with better-sqlite3 12.11.1, Vitest 5.0.5.
+How a Nest app calls slow or failing dependencies: one `@nestjs/resilience` preset per dependency, decorators on entrypoints, policy objects in services, a dead-letter record for every call that exhausts its retries, downstream calls dispatched after commit, and the right deduplication for each kind of duplicate request. Verified 2026-10-29 against NestJS 12.3.2, @nestjs/resilience 0.0.3, @nestjs/idempotency 0.0.3, TypeORM 1.1.2 with better-sqlite3 12.11.1, Vitest 5.0.5; the outbound HTTP examples against @nestjs/http-client 0.0.2 and @nestjs/config 12.0.1 on Node 24.22.2.
 
-Project setup (ESM, SWC, Vitest) is `nestjs-setup`; transactions, migrations and unique-violation handling are `nestjs-typeorm`; tests with fake dependencies and fake timers are `nestjs-testing`.
+Project setup (ESM, SWC, Vitest) is `nestjs-setup`; transactions, migrations and unique-violation handling are `nestjs-typeorm`; tests with fake dependencies and fake timers are `nestjs-testing`; the HTTP transport (`@nestjs/http-client` clients, registered with `retry: false` so retries happen only here) is `nestjs-http-client`; log levels are `nestjs-logging`.
 
 ## Rules
 | Prefix | Section | Impact |
@@ -22,14 +22,14 @@ Project setup (ESM, SWC, Vitest) is `nestjs-setup`; transactions, migrations and
 
 ### 1. Resilience Policies (CRITICAL)
 
-- `resilience-module-presets` - Pin the package; register `ResilienceModule` once with one preset per dependency; `attempts` counts the first call; 4xx errors are not retried
+- `resilience-module-presets` - Pin the package; register `ResilienceModule` once with one preset per dependency; `attempts` counts the first call; 4xx errors (an `HttpResponseError`'s `status`) are not retried
 - `resilience-entrypoint-decorators` - Resilience decorators go on controller, resolver and message handlers; a retried POST needs `@Retry({ idempotent: true })`
-- `resilience-service-policy` - Services call dependencies through a policy object created once, passing the attempt's `signal`; retry only repeat-safe calls, at one layer
-- `resilience-dispatch-after-commit` - Call downstream dependencies after the transaction commits, and answer without waiting when the contract allows it
+- `resilience-service-policy` - Services call dependencies through a policy object created once, passing the attempt's `signal`; retry only repeat-safe calls, at one layer, with the HTTP client's own retry off
+- `resilience-dispatch-after-commit` - Call downstream dependencies after the transaction commits; answer without waiting through a tracked `dispatch()` that never rejects, when the contract allows it
 
 ### 2. Dead Letters (HIGH)
 
-- `dlq-record-final-failure` - Record every call that exhausts its retries in an injectable dead-letter store; log retries from `ResilienceEvents.events$`
+- `dlq-record-final-failure` - Record every call that exhausts its retries in an injectable dead-letter store; fire-and-forget through a `dispatch()` that ends in a `.catch` logging a failed store at `error`, tracks the job in a `pending` set, and exposes `drain()`, awaited in `beforeApplicationShutdown`; log retries from `ResilienceEvents.events$` with the error as third argument
 
 ### 3. Idempotency (HIGH)
 

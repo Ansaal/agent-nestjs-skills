@@ -86,31 +86,31 @@ export class AppModule {}
 **When to use @Global() (sparingly):**
 
 ```typescript
-// ONLY for truly cross-cutting concerns
+// ONLY for truly cross-cutting infrastructure, e.g. the app-wide transaction runner (nestjs-typeorm)
 @Global()
 @Module({
-  providers: [ConfigService, LoggerService],
-  exports: [ConfigService, LoggerService],
+  providers: [TransactionRunner],
+  exports: [TransactionRunner],
 })
-export class CoreModule {}
+export class DatabaseModule {}
 
 // Import once in AppModule
 @Module({
-  imports: [CoreModule], // Registered globally, available everywhere
+  imports: [DatabaseModule], // Registered globally, available everywhere
 })
 export class AppModule {}
 
-// Other modules don't need to import CoreModule
+// Other modules don't need to import DatabaseModule
 @Module({
   controllers: [UsersController],
-  providers: [UsersService], // Can inject ConfigService without importing
+  providers: [UsersService], // Can inject TransactionRunner without importing
 })
 export class UsersModule {}
 
 // WARNING: Don't make everything global!
 // - Hides dependencies (can't see what a module needs from imports)
 // - Makes testing harder
-// - Reserve for: config, logging, database connections
+// - Config: ConfigModule.forRoot({ isGlobal: true }), never re-provide ConfigService yourself
 ```
 
 **Module re-exporting pattern:**

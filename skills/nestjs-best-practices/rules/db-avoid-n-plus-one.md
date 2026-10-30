@@ -7,133 +7,59 @@ tags: database, n-plus-one, queries, performance
 
 ## Avoid N+1 Query Problems
 
-N+1 queries occur when you fetch a list of entities, then make an additional query for each entity to load related data. Use eager loading with `relations`, query builder joins, or DataLoader to batch queries efficiently.
+N+1 queries happen when you load a list, then issue one more query per row for its related data. Load the relations with the list (`relations`, or a query-builder join), aggregate in SQL when you only need counts, and batch per request (DataLoader over one `In(ids)` query) when resolvers fetch relations field by field. TypeORM 1.x query syntax (object `relations`/`select`, no string arrays) is owned by `nestjs-typeorm` rule `orm-v1-removed-apis`; entities type relations as `Relation<T>` (`orm-relation-wrapper`).
 
-**Incorrect (lazy loading in loops causes N+1):**
+**Incorrect (one query per order):**
 
 ```typescript
-// Lazy loading in loops causes N+1
-@Injectable()
-export class OrdersService {
-  async getOrdersWithItems(userId: string): Promise<Order[]> {
-    const orders = await this.orderRepo.find({ where: { userId } });
-    // 1 query for orders
-
-    for (const order of orders) {
-      // N additional queries - one per order!
-      order.items = await this.itemRepo.find({ where: { orderId: order.id } });
-    }
-
-    return orders;
+async getOrdersWithItems(userId: string): Promise<Order[]> {
+  const orders = await this.orders.find({ where: { userId } }); // 1 query
+  for (const order of orders) {
+    order.items = await this.items.find({ where: { order: { id: order.id } } }); // + 1 per order
   }
-}
-
-// Accessing lazy relations without loading
-@Controller('users')
-export class UsersController {
-  @Get()
-  async findAll(): Promise<User[]> {
-    const users = await this.userRepo.find();
-    // If User.posts is lazy-loaded, serializing triggers N queries
-    return users; // Each user.posts access = 1 query
-  }
+  return orders;
 }
 ```
 
-**Correct (use relations for eager loading):**
+**Correct (relations loaded with the list; counts aggregated in SQL):**
 
 ```typescript
-// Use relations option for eager loading
-@Injectable()
-export class OrdersService {
-  async getOrdersWithItems(userId: string): Promise<Order[]> {
-    // Single query with JOIN
-    return this.orderRepo.find({
-      where: { userId },
-      relations: ['items', 'items.product'],
-    });
-  }
-}
-
-// Use QueryBuilder for complex joins
-@Injectable()
-export class UsersService {
-  async getUsersWithPostCounts(): Promise<UserWithPostCount[]> {
-    return this.userRepo
-      .createQueryBuilder('user')
-      .leftJoin('user.posts', 'post')
-      .select('user.id', 'id')
-      .addSelect('user.name', 'name')
-      .addSelect('COUNT(post.id)', 'postCount')
-      .groupBy('user.id')
-      .getRawMany();
-  }
-
-  async getActiveUsersWithPosts(): Promise<User[]> {
-    return this.userRepo
-      .createQueryBuilder('user')
-      .leftJoinAndSelect('user.posts', 'post')
-      .leftJoinAndSelect('post.comments', 'comment')
-      .where('user.isActive = :active', { active: true })
-      .andWhere('post.status = :status', { status: 'published' })
-      .getMany();
-  }
-}
-
-// Use find options for specific fields
-async getOrderSummaries(userId: string): Promise<OrderSummary[]> {
-  return this.orderRepo.find({
+getOrdersWithItems(userId: string): Promise<Order[]> {
+  return this.orders.find({
     where: { userId },
-    relations: ['items'],
-    select: {
-      id: true,
-      total: true,
-      status: true,
-      items: {
-        id: true,
-        quantity: true,
-        price: true,
-      },
-    },
+    relations: { items: { product: true } },
   });
 }
 
-// Use DataLoader for GraphQL to batch and cache queries
-import DataLoader from 'dataloader';
+getUsersWithPostCounts(): Promise<{ id: string; name: string; postCount: number }[]> {
+  return this.users
+    .createQueryBuilder('user')
+    .leftJoin('user.posts', 'post')
+    .select('user.id', 'id')
+    .addSelect('user.name', 'name')
+    .addSelect('COUNT(post.id)', 'postCount')
+    .groupBy('user.id')
+    .getRawMany();
+}
 
-@Injectable({ scope: Scope.REQUEST })
-export class PostsLoader {
-  constructor(private postsService: PostsService) {}
+getActiveUsersWithPublishedPosts(): Promise<User[]> {
+  return this.users
+    .createQueryBuilder('user')
+    // the condition belongs to the join: users without published posts stay in the result
+    .leftJoinAndSelect('user.posts', 'post', 'post.status = :status', { status: 'published' })
+    .where('user.isActive = :active', { active: true })
+    .getMany();
+}
 
-  readonly batchPosts = new DataLoader<string, Post[]>(async (userIds) => {
-    // Single query for all users' posts
-    const posts = await this.postsService.findByUserIds([...userIds]);
-
-    // Group by userId
-    const postsMap = new Map<string, Post[]>();
-    for (const post of posts) {
-      const userPosts = postsMap.get(post.userId) || [];
-      userPosts.push(post);
-      postsMap.set(post.userId, userPosts);
-    }
-
-    // Return in same order as input
-    return userIds.map((id) => postsMap.get(id) || []);
+getOrderSummaries(userId: string): Promise<Order[]> {
+  return this.orders.find({
+    where: { userId },
+    relations: { items: true },
+    select: { id: true, total: true, status: true, items: { id: true, quantity: true, price: true } },
   });
 }
-
-// In resolver
-@ResolveField()
-async posts(@Parent() user: User): Promise<Post[]> {
-  // DataLoader batches multiple calls into single query
-  return this.postsLoader.batchPosts.load(user.id);
-}
-
-// Enable query logging in development to detect N+1
-TypeOrmModule.forRoot({
-  logging: ['query', 'error'],
-  logger: 'advanced-console',
-});
 ```
 
-Reference: [TypeORM Relations](https://typeorm.io/relations)
+With five orders of one item each, the loop issued 6 `SELECT`s and `relations: { items: { product: true } }` issued 1, with every `items[].product` populated. `getOrderSummaries` returned `{"id":…,"status":"open","total":0,"items":[{"id":…,"quantity":1,"price":2}]}`, nothing else. To spot N+1 in development, turn on `logging: ['query']` in the one `dataSourceOptions` (`nestjs-typeorm` rule `orm-single-data-source`), not in a second `TypeOrmModule.forRoot`.
+
+Reference: [TypeORM Find Options](https://typeorm.io/docs/working-with-entity-manager/find-options/)

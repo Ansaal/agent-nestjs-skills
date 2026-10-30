@@ -34,10 +34,14 @@ npx skills add Ansaal/agent-nestjs-skills -a claude-code -a cursor
 |-------|-----------|
 | `nestjs-best-practices` | Architecture, DI, errors, security, performance, API design (upstream rules) |
 | `nestjs-fdd` | Planning a feature or app with Feature-Driven Development, one Nest module per feature set |
-| `nestjs-setup` | Newest Nest version, Node, ESM, SWC builder, Vitest configuration |
+| `nestjs-setup` | Newest Nest version, Node, ESM, SWC builder, Vitest configuration, ESLint and Prettier |
 | `nestjs-testing` | Unit tests with `useMocker()` auto-mocking, e2e tests with Supertest |
 | `nestjs-typeorm` | `@nestjs/typeorm` data source, migrations, transactions |
 | `nestjs-resilience` | `@nestjs/resilience`, idempotency, dead-letter handling |
+| `nestjs-http-client` | `@nestjs/http-client` outbound HTTP clients: named clients, timeouts, typed errors, tests |
+| `nestjs-schedule` | `@nestjs/schedule` cron, interval and timeout jobs, and timers in tests |
+| `nestjs-locks` | `@nestjs/locks` distributed locks, job decorators, durable lock stores |
+| `nestjs-logging` | Logger setup (`ConsoleLogger` JSON) and the log level policy |
 
 ## Structure
 

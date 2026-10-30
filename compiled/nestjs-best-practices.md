@@ -14,7 +14,7 @@ October 2026
 
 ## Abstract
 
-NestJS best practices and architecture patterns for building production-ready applications. This skill should be used when writing, reviewing, or refactoring NestJS code to ensure proper patterns for modules, dependency injection, security, and performance.
+General NestJS architecture, dependency injection, error handling, security (authentication, authorization, input validation, rate limiting), API design (serialization, versioning, pipes, interceptors), performance and microservice patterns. Use when designing modules and providers, securing endpoints, shaping API contracts, or reviewing NestJS code for those concerns. For persistence, tests, toolchain, outbound HTTP, retries and idempotency, scheduled jobs, locks or logging, load the owning skill listed under Related Skills instead.
 
 ---
 
@@ -25,7 +25,7 @@ NestJS best practices and architecture patterns for building production-ready ap
    - 1.2 [Organize by Feature Modules](#12-organize-by-feature-modules)
    - 1.3 [Use Proper Module Sharing Patterns](#13-use-proper-module-sharing-patterns)
    - 1.4 [Single Responsibility for Services](#14-single-responsibility-for-services)
-   - 1.5 [Use Event-Driven Architecture for Decoupling](#15-use-event-driven-architecture-for-decoupling)
+   - 1.5 [Use Events for Decoupling, Not for Required Work](#15-use-events-for-decoupling-not-for-required-work)
    - 1.6 [Use Repository Pattern for Data Access](#16-use-repository-pattern-for-data-access)
 2. [Dependency Injection](#2-dependency-injection) — **CRITICAL**
    - 2.1 [Avoid Service Locator Anti-Pattern](#21-avoid-service-locator-anti-pattern)
@@ -39,7 +39,7 @@ NestJS best practices and architecture patterns for building production-ready ap
    - 3.2 [Throw HTTP Exceptions from Services](#32-throw-http-exceptions-from-services)
    - 3.3 [Use Exception Filters for Error Handling](#33-use-exception-filters-for-error-handling)
 4. [Security](#4-security) — **HIGH**
-   - 4.1 [Implement Secure JWT Authentication](#41-implement-secure-jwt-authentication)
+   - 4.1 [Issue and Verify Short-Lived JWT Access Tokens](#41-issue-and-verify-short-lived-jwt-access-tokens)
    - 4.2 [Implement Rate Limiting](#42-implement-rate-limiting)
    - 4.3 [Sanitize Output to Prevent XSS](#43-sanitize-output-to-prevent-xss)
    - 4.4 [Use Guards for Authentication and Authorization](#44-use-guards-for-authentication-and-authorization)
@@ -51,8 +51,6 @@ NestJS best practices and architecture patterns for building production-ready ap
    - 5.4 [Use Caching Strategically](#54-use-caching-strategically)
 6. [Database & ORM](#6-database-orm) — **MEDIUM-HIGH**
    - 6.1 [Avoid N+1 Query Problems](#61-avoid-n-1-query-problems)
-   - 6.2 [Use Database Migrations](#62-use-database-migrations)
-   - 6.3 [Use Transactions for Multi-Step Operations](#63-use-transactions-for-multi-step-operations)
 7. [API Design](#7-api-design) — **MEDIUM**
    - 7.1 [Use DTOs and Serialization for API Responses](#71-use-dtos-and-serialization-for-api-responses)
    - 7.2 [Use Interceptors for Cross-Cutting Concerns](#72-use-interceptors-for-cross-cutting-concerns)
@@ -65,7 +63,6 @@ NestJS best practices and architecture patterns for building production-ready ap
 9. [DevOps & Deployment](#9-devops-deployment) — **LOW-MEDIUM**
    - 9.1 [Implement Graceful Shutdown](#91-implement-graceful-shutdown)
    - 9.2 [Use ConfigModule for Environment Configuration](#92-use-configmodule-for-environment-configuration)
-   - 9.3 [Use Structured Logging](#93-use-structured-logging)
 
 ---
 
@@ -124,15 +121,18 @@ export class UsersModule {}
 })
 export class OrdersModule {}
 
-// Option 2: Use events for decoupled communication
+// Option 2: Use events for decoupled communication (best-effort reactions only; see arch-use-events)
 // users.service.ts
 @Injectable()
 export class UsersService {
-  constructor(private eventEmitter: EventEmitter2) {}
+  constructor(
+    private readonly usersRepo: UsersRepository, // writes through TransactionRunner (nestjs-typeorm)
+    private readonly eventEmitter: EventEmitter2,
+  ) {}
 
-  async createUser(data: CreateUserDto) {
-    const user = await this.userRepo.save(data);
-    this.eventEmitter.emit('user.created', user);
+  async createUser(dto: CreateUserDto): Promise<User> {
+    const user = await this.usersRepo.insert(dto);
+    this.eventEmitter.emit('user.created', new UserCreatedEvent(user.id));
     return user;
   }
 }
@@ -141,8 +141,8 @@ export class UsersService {
 @Injectable()
 export class OrdersService {
   @OnEvent('user.created')
-  handleUserCreated(user: User) {
-    // React to user creation without direct dependency
+  async handleUserCreated(event: UserCreatedEvent): Promise<void> {
+    // React to user creation without importing UsersModule
   }
 }
 ```
@@ -314,31 +314,31 @@ export class AppModule {}
 **When to use @Global() (sparingly):**
 
 ```typescript
-// ONLY for truly cross-cutting concerns
+// ONLY for truly cross-cutting infrastructure, e.g. the app-wide transaction runner (nestjs-typeorm)
 @Global()
 @Module({
-  providers: [ConfigService, LoggerService],
-  exports: [ConfigService, LoggerService],
+  providers: [TransactionRunner],
+  exports: [TransactionRunner],
 })
-export class CoreModule {}
+export class DatabaseModule {}
 
 // Import once in AppModule
 @Module({
-  imports: [CoreModule], // Registered globally, available everywhere
+  imports: [DatabaseModule], // Registered globally, available everywhere
 })
 export class AppModule {}
 
-// Other modules don't need to import CoreModule
+// Other modules don't need to import DatabaseModule
 @Module({
   controllers: [UsersController],
-  providers: [UsersService], // Can inject ConfigService without importing
+  providers: [UsersService], // Can inject TransactionRunner without importing
 })
 export class UsersModule {}
 
 // WARNING: Don't make everything global!
 // - Hides dependencies (can't see what a module needs from imports)
 // - Makes testing harder
-// - Reserve for: config, logging, database connections
+// - Config: ConfigModule.forRoot({ isGlobal: true }), never re-provide ConfigService yourself
 ```
 
 **Module re-exporting pattern:**
@@ -412,169 +412,205 @@ export class UserAndOrderService {
 }
 ```
 
-**Correct (focused services with single responsibility):**
+**Correct (focused services; one application service owns the workflow; thin controller):**
 
 ```typescript
-// Focused services with single responsibility
-@Injectable()
-export class UsersService {
-  constructor(private userRepo: UserRepository) {}
-
-  async create(dto: CreateUserDto): Promise<User> {
-    return this.userRepo.save(dto);
-  }
-
-  async findById(id: string): Promise<User> {
-    return this.userRepo.findOneOrFail({ where: { id } });
-  }
+// orders/order.entity.ts (excerpt) and orders/orders.dto.ts
+@Entity('orders')
+@Index(['userId', 'checkoutId'], { unique: true }) // one order per client checkout attempt
+export class Order {
+  @PrimaryGeneratedColumn('uuid') id: string;
+  @Column() userId: string;
+  @Column() checkoutId: string;
+  @Column('integer') total: number;
+  @Column() currency: string;
+  @Column({ type: 'varchar', default: 'pending' }) status: 'pending' | 'paid';
+  @Column({ type: 'varchar', nullable: true }) chargeId: string | null;
 }
 
+export class PlaceOrderDto {
+  /** Generated by the client once per checkout and resent on every retry of it. */
+  @IsUUID() checkoutId: string;
+  @IsInt() @IsPositive() total: number;
+  @IsIn(['usd', 'eur', 'gbp']) currency: string;
+}
+```
+
+```typescript
+// orders/orders.service.ts: order state only
 @Injectable()
 export class OrdersService {
-  constructor(private orderRepo: OrderRepository) {}
+  constructor(
+    private readonly transactions: TransactionRunner,
+    @InjectRepository(Order) private readonly orders: Repository<Order>,
+  ) {}
 
-  async create(userId: string, dto: CreateOrderDto): Promise<Order> {
-    return this.orderRepo.save({ userId, ...dto });
+  /** One order per (user, checkoutId): the insert is skipped when it exists, then both callers read the same row. */
+  findOrCreatePending(userId: string, dto: PlaceOrderDto): Promise<Order> {
+    return this.transactions.run(async (manager) => {
+      await manager.createQueryBuilder().insert().into(Order).values({ userId, ...dto, status: 'pending' }).orIgnore().execute();
+      return manager.findOneByOrFail(Order, { userId, checkoutId: dto.checkoutId });
+    });
   }
 
-  async findByUser(userId: string): Promise<Order[]> {
-    return this.orderRepo.find({ where: { userId } });
+  /** `won` is true only for the call that moved the order from pending to paid. */
+  markPaid(orderId: string, chargeId: string): Promise<{ order: Order; won: boolean }> {
+    return this.transactions.run(async (manager) => {
+      const { affected } = await manager.update(Order, { id: orderId, status: 'pending' }, { status: 'paid', chargeId });
+      return { order: await manager.findOneByOrFail(Order, { id: orderId }), won: affected === 1 };
+    });
+  }
+
+  findByUser(userId: string): Promise<Order[]> {
+    return this.orders.findBy({ userId });
   }
 }
 
 @Injectable()
 export class OrderStatsService {
-  constructor(private orderRepo: OrderRepository) {}
+  constructor(@InjectRepository(Order) private readonly orders: Repository<Order>) {}
 
-  async calculateForUser(userId: string): Promise<OrderStats> {
-    // Focused stats calculation
+  async calculateForUser(userId: string): Promise<{ count: number; total: number }> {
+    const [count, total] = await Promise.all([this.orders.countBy({ userId }), this.orders.sum('total', { userId })]);
+    return { count, total: total ?? 0 };
   }
 }
 
-// Orchestration in controller or dedicated orchestrator
-@Controller('orders')
-export class OrdersController {
+// orders/checkout.service.ts: the workflow and its failure handling
+@Injectable()
+export class CheckoutService {
   constructor(
-    private orders: OrdersService,
-    private payment: PaymentService,
-    private notifications: NotificationService,
+    private readonly orders: OrdersService,
+    @Inject(PAYMENT_GATEWAY) private readonly payments: PaymentGateway,
+    private readonly notifications: NotificationService,
   ) {}
 
+  async checkout(userId: string, dto: PlaceOrderDto): Promise<Order> {
+    const order = await this.orders.findOrCreatePending(userId, dto); // committed before any remote call
+    if (order.status === 'paid') return order; // an earlier attempt finished
+    // Same order, same charge: the gateway returns the first charge for a repeated orderId
+    const { chargeId } = await this.payments.charge({ orderId: order.id, amount: order.total, currency: order.currency });
+    const { order: paid, won } = await this.orders.markPaid(order.id, chargeId);
+    if (won) this.notifications.dispatchOrderConfirmed(paid.id); // a concurrent attempt that lost returns the paid order only
+    return paid;
+  }
+}
+
+// orders/orders.controller.ts: HTTP only
+@Controller('orders')
+export class OrdersController {
+  constructor(private readonly checkoutService: CheckoutService) {}
+
   @Post()
-  async create(@CurrentUser() user: User, @Body() dto: CreateOrderDto) {
-    const order = await this.orders.create(user.id, dto);
-    await this.payment.charge(order);
-    await this.notifications.sendOrderConfirmation(order);
-    return order;
+  checkout(@CurrentUser() user: AuthenticatedUser, @Body() dto: PlaceOrderDto): Promise<Order> {
+    return this.checkoutService.checkout(user.id, dto);
   }
 }
 ```
+
+The controller maps HTTP to one call; `CheckoutService` is the only class that knows the order of steps and what a failure in each leaves behind. The remote charge runs after the order commits, never inside its transaction (`nestjs-resilience` rule `resilience-dispatch-after-commit`). The client sends one `checkoutId` per checkout and resends it on every retry. The insert is `INSERT … ON CONFLICT DO NOTHING` on the unique index, followed by a read of the row, so concurrent attempts share one order without a check-then-insert. `PaymentGateway` and its implementations are in `di-liskov-substitution`: `charge()` uses the order id as its idempotency key and returns the first charge for a repeated one. `markPaid()` updates only `WHERE status = 'pending'`, so exactly one attempt wins and dispatches the confirmation. `@Idempotent()` (`nestjs-resilience` rule `idempotency-client-keys`) is not enough on its own, because a 5xx releases its key and the retry runs the handler again. In the probe:
+
+- A charge followed by a failing `markPaid()` answered 500 with the order `pending`; the retry with the same body answered `201 paid mock_ch_1`, with 1 order and 1 confirmation. A rejected charge likewise answered 500 and its retry 201 `paid`.
+- Two concurrent requests with the same body both answered 201 with one order, 2 gateway calls, 1 distinct charge and 1 confirmation; the previous unguarded `markPaid()` sent 2 confirmations.
+- Two processes sharing the database file ran the previous find-then-save concurrently and one failed with `SqliteError: database is locked`; with insert-or-ignore both got the same order id, 5 runs out of 5.
+
+Gateway keys expire (Stripe: after 24 h at the earliest), so a scheduled job reconciles orders still `pending` past that window by looking the charge up at the gateway and calling `markPaid()`, never `charge()`. `dispatchOrderConfirmed()` is a `dispatch()` in the shape of `nestjs-resilience` rule `dlq-record-final-failure`: it returns `void`, ends its promise in a terminal `.catch` and tracks it for `drain()`. Writes, and the reads that follow them, go through `TransactionRunner` (`nestjs-typeorm` rule `orm-atomic-writes`); `CurrentUser` is in `security-use-guards`.
 
 Reference: [NestJS Providers](https://docs.nestjs.com/providers)
 
 ---
 
-### 1.5 Use Event-Driven Architecture for Decoupling
+### 1.5 Use Events for Decoupling, Not for Required Work
 
-**Impact: MEDIUM-HIGH** — Enables async processing and modularity
+**Impact: MEDIUM-HIGH** — Decouples modules; a best-effort emit used for required work loses it silently
 
-Use `@nestjs/event-emitter` for intra-service events and message brokers for inter-service communication. Events allow modules to react to changes without direct dependencies, improving modularity and enabling async processing.
+`@nestjs/event-emitter` lets modules react to a change without the emitter knowing them. Decide per reaction whether it is best effort or required, because the defaults are built for best effort: `emit()` returns before async listeners finish, and `@OnEvent` listeners default to `suppressErrors: true`, so a listener that rejects is caught and logged by the emitter (`error`, context `Event`) and neither `emit()` nor `emitAsync()` sees the failure. In the probe, `emitAsync()` on a rejecting default listener resolved; with `{ suppressErrors: false }` it rejected with the listener's error.
 
-**Incorrect (direct service coupling):**
+- **Best effort** (analytics, cache warm-up): `emit()` after the commit; each listener catches and logs its own failure.
+- **Required, in-process** (reserve stock in the same database): `await emitAsync()` inside the transaction, with **exactly one** required listener per event, `@OnEvent(…, { suppressErrors: false })`. A rejecting listener rejects `emitAsync()` and rolls the whole transaction back. The listener's writes go through `TransactionRunner.run()`, which joins the open transaction (re-entrant, `nestjs-typeorm` rule `orm-atomic-writes`). `emitAsync()` runs listeners concurrently (`Promise.all`), so with two, one can reject and roll back while the other is still running; that one's write then lands outside the transaction. When several required steps must succeed together, don't use an event: the service calls them one after another inside its `run()`.
+- **Required, another system** (email provider, payment, broker): not an in-process event. Write an outbox row in the same transaction and dispatch it after the commit with retries and dead letters, per `nestjs-resilience` (`resilience-dispatch-after-commit`, `dlq-record-final-failure`).
+
+**Incorrect (direct coupling; or required work behind a fire-and-forget emit):**
 
 ```typescript
-// Direct service coupling
-@Injectable()
-export class OrdersService {
-  constructor(
-    private inventoryService: InventoryService,
-    private emailService: EmailService,
-    private analyticsService: AnalyticsService,
-    private notificationService: NotificationService,
-    private loyaltyService: LoyaltyService,
-  ) {}
-
-  async createOrder(dto: CreateOrderDto): Promise<Order> {
-    const order = await this.repo.save(dto);
-
-    // Tight coupling - OrdersService knows about all consumers
-    await this.inventoryService.reserve(order.items);
-    await this.emailService.sendConfirmation(order);
-    await this.analyticsService.track('order_created', order);
-    await this.notificationService.push(order.userId, 'Order placed');
-    await this.loyaltyService.addPoints(order.userId, order.total);
-
-    // Adding new behavior requires modifying this service
-    return order;
-  }
+async createOrder(dto: CreateOrderDto): Promise<Order> {
+  const order = await this.repo.save(dto);
+  await this.inventoryService.reserve(order.items); // OrdersService knows every consumer
+  await this.emailService.sendConfirmation(order);
+  await this.analyticsService.track('order_created', order);
+  return order;
 }
+
+// …or "decoupled": a failed reservation is logged by the emitter and the order still returns 201
+this.eventEmitter.emit('order.created', new OrderCreatedEvent(order.id, order.items));
 ```
 
-**Correct (event-driven decoupling):**
+**Correct (required listener inside the transaction, best-effort listeners after the commit):**
 
 ```typescript
-// Use EventEmitter for decoupling
+// orders/orders.service.ts
+import { Injectable } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { TransactionRunner } from '../database/transaction-runner.js';
+import { OrderPlacedEvent } from './order-placed.event.js';
+import { Order } from './order.entity.js';
+import type { PlaceOrderDto } from './orders.dto.js';
 
-// Define event
-export class OrderCreatedEvent {
-  constructor(
-    public readonly orderId: string,
-    public readonly userId: string,
-    public readonly items: OrderItem[],
-    public readonly total: number,
-  ) {}
-}
-
-// Service emits events
 @Injectable()
 export class OrdersService {
   constructor(
-    private eventEmitter: EventEmitter2,
-    private repo: Repository<Order>,
+    private readonly transactions: TransactionRunner,
+    private readonly events: EventEmitter2,
   ) {}
 
-  async createOrder(dto: CreateOrderDto): Promise<Order> {
-    const order = await this.repo.save(dto);
-
-    // Emit event - no knowledge of consumers
-    this.eventEmitter.emit(
-      'order.created',
-      new OrderCreatedEvent(order.id, order.userId, order.items, order.total),
-    );
-
+  async place(userId: string, dto: PlaceOrderDto): Promise<Order> {
+    const order = await this.transactions.run(async (manager) => {
+      const order = await manager.save(Order, { userId, ...dto });
+      // Required: its one listener runs inside this transaction; a rejection rolls the order back
+      await this.events.emitAsync('order.placing', toEvent(order));
+      return order;
+    });
+    // Best effort, after the commit: emit() returns at once, each listener owns its failures
+    this.events.emit('order.placed', toEvent(order));
     return order;
   }
 }
 
-// Listeners in separate modules
+const toEvent = (order: Order) => new OrderPlacedEvent(order.id, order.userId, order.sku, order.quantity, order.total);
+```
+
+```typescript
+// inventory/inventory.listener.ts (required)
 @Injectable()
 export class InventoryListener {
-  @OnEvent('order.created')
-  async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
-    await this.inventoryService.reserve(event.items);
+  constructor(private readonly inventory: InventoryService) {}
+
+  @OnEvent('order.placing', { suppressErrors: false })
+  async reserve(event: OrderPlacedEvent): Promise<void> {
+    await this.inventory.reserve(event.sku, event.quantity); // throws ConflictException when out of stock
   }
 }
 
-@Injectable()
-export class EmailListener {
-  @OnEvent('order.created')
-  async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
-    await this.emailService.sendConfirmation(event.orderId);
-  }
-}
-
+// analytics/analytics.listener.ts (best effort)
 @Injectable()
 export class AnalyticsListener {
-  @OnEvent('order.created')
-  async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
-    await this.analyticsService.track('order_created', {
-      orderId: event.orderId,
-      total: event.total,
-    });
+  private readonly logger = new Logger(AnalyticsListener.name);
+
+  constructor(private readonly analytics: AnalyticsService) {}
+
+  @OnEvent('order.placed')
+  async track(event: OrderPlacedEvent): Promise<void> {
+    try {
+      await this.analytics.track('order_placed', { orderId: event.orderId, total: event.total });
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.logger.warn('Order analytics dropped', { orderId: event.orderId }, err);
+    }
   }
 }
 ```
+
+`EventEmitterModule.forRoot()` is imported once in `AppModule`. In the probe, with stock 3, a first order for 2 returned 201 and left 1 in stock; a second order for 2 returned `409 {"message":"Out of stock",…}` and the order count stayed at 1 (rolled back); with analytics rejecting, the order still returned 201 and logged `warn` `Order analytics dropped` with the error. With a second required listener on `order.placing` that rejected (`Credit limit reached`) while the inventory listener was still awaiting, `place()` rejected with 0 orders and stock 3, and 100 ms later stock was 1: the reservation had run after the rollback as its own transaction and committed. Keep required listeners to local database work: a remote call inside the transaction holds SQLite's single writer lock for its whole timeout and cannot be rolled back.
 
 Reference: [NestJS Events](https://docs.nestjs.com/techniques/events)
 
@@ -613,63 +649,59 @@ export class UsersService {
 }
 ```
 
-**Correct (custom repository with encapsulated queries):**
+**Correct (custom repository with encapsulated queries and writes):**
 
 ```typescript
-// Custom repository with encapsulated queries
+// users/users.repository.ts
 @Injectable()
 export class UsersRepository {
   constructor(
-    @InjectRepository(User) private repo: Repository<User>,
+    @InjectRepository(User) private readonly users: Repository<User>,
+    private readonly transactions: TransactionRunner,
   ) {}
 
-  async findById(id: string): Promise<User | null> {
-    return this.repo.findOne({ where: { id } });
+  findById(id: string): Promise<User | null> {
+    return this.users.findOneBy({ id });
   }
 
-  async findByEmail(email: string): Promise<User | null> {
-    return this.repo.findOne({ where: { email } });
-  }
-
-  async findActiveWithMinOrders(minOrders: number): Promise<User[]> {
-    return this.repo
+  findActiveWithMinOrders(minOrders: number): Promise<User[]> {
+    return this.users
       .createQueryBuilder('user')
-      .leftJoinAndSelect('user.orders', 'order')
+      .leftJoin('user.orders', 'order') // joined to count, not selected
       .where('user.isActive = :active', { active: true })
-      .andWhere('user.deletedAt IS NULL')
       .groupBy('user.id')
       .having('COUNT(order.id) >= :min', { min: minOrders })
       .orderBy('user.createdAt', 'DESC')
       .getMany();
   }
 
-  async save(user: User): Promise<User> {
-    return this.repo.save(user);
+  /** A duplicate email rejects with the unique-constraint violation; the caller maps it. */
+  insert(data: Pick<User, 'email' | 'name'>): Promise<User> {
+    return this.transactions.run((manager) => manager.save(User, { ...data, roles: ['member'] }));
   }
 }
 
-// Clean service with business logic only
+// users/users.service.ts: business rules only
 @Injectable()
 export class UsersService {
-  constructor(private usersRepo: UsersRepository) {}
+  constructor(private readonly usersRepo: UsersRepository) {}
 
-  async getActiveUsersWithOrders(): Promise<User[]> {
+  getActiveUsersWithOrders(): Promise<User[]> {
     return this.usersRepo.findActiveWithMinOrders(1);
   }
 
   async create(dto: CreateUserDto): Promise<User> {
-    const existing = await this.usersRepo.findByEmail(dto.email);
-    if (existing) {
-      throw new ConflictException('Email already registered');
+    try {
+      return await this.usersRepo.insert({ email: dto.email, name: dto.name });
+    } catch (error) {
+      if (isUniqueViolation(error)) throw new ConflictException('Email already registered');
+      throw error;
     }
-
-    const user = new User();
-    user.email = dto.email;
-    user.name = dto.name;
-    return this.usersRepo.save(user);
   }
 }
 ```
+
+No `findByEmail` pre-check: two concurrent requests both see "absent", so the unique index on `email` decides and the service maps its violation to 409 (in the probe a second `POST /users` with the same email answered `409 {"message":"Email already registered",…}`). Persistence rules are owned by `nestjs-typeorm`: every write through `TransactionRunner` (`orm-atomic-writes`), `isUniqueViolation()` and the driver codes (`orm-unique-violation`), `Relation<T>` and the 1.x find forms (`orm-relation-wrapper`, `orm-v1-removed-apis`).
 
 Reference: [Repository Pattern](https://martinfowler.com/eaaCatalog/repository.html)
 
@@ -741,24 +773,6 @@ export class OrdersService {
   }
 }
 
-// Easy to test with mocks
-describe('OrdersService', () => {
-  let service: OrdersService;
-
-  beforeEach(async () => {
-    const module = await Test.createTestingModule({
-      providers: [
-        OrdersService,
-        { provide: UsersService, useValue: mockUsersService },
-        { provide: InventoryService, useValue: mockInventoryService },
-        { provide: PaymentService, useValue: mockPaymentService },
-      ],
-    }).compile();
-
-    service = module.get(OrdersService);
-  });
-});
-
 // VALID: Factory pattern for dynamic instantiation
 @Injectable()
 export class HandlerFactory {
@@ -776,6 +790,8 @@ export class HandlerFactory {
   }
 }
 ```
+
+Constructor dependencies are what lets a unit test compile `OrdersService` alone and have `useMocker(autoMock)` supply the rest; `ModuleRef.get()` lookups are invisible to it. Test structure is owned by `nestjs-testing` (`unit-automock-dependencies`).
 
 Reference: [NestJS Module Reference](https://docs.nestjs.com/fundamentals/module-ref)
 
@@ -950,167 +966,144 @@ Reference: [Interface Segregation Principle](https://en.wikipedia.org/wiki/Inter
 
 Subtypes must be substitutable for their base types without altering program correctness. In NestJS with dependency injection, this means any implementation of an interface or abstract class must honor the contract completely. A mock payment service used in tests must behave like a real payment service (return similar shapes, handle errors the same way). Violating LSP causes subtle bugs when swapping implementations.
 
-**Incorrect (implementation violates the contract):**
+**Incorrect (implementations break the contract):**
 
 ```typescript
-// Base interface with clear contract
-interface PaymentGateway {
-  /**
-   * Charges the specified amount.
-   * @returns PaymentResult on success
-   * @throws PaymentFailedException on payment failure
-   */
-  charge(amount: number, currency: string): Promise<PaymentResult>;
-}
-
-// Production implementation - follows the contract
+// Production implementation: no idempotency key, so a retried charge for the same order charges twice
 @Injectable()
 export class StripeService implements PaymentGateway {
-  async charge(amount: number, currency: string): Promise<PaymentResult> {
+  async charge({ amount, currency }: ChargeInput): Promise<Charge> {
     const response = await this.stripe.charges.create({ amount, currency });
-    return { success: true, transactionId: response.id, amount };
+    return { chargeId: response.id, amount };
   }
 }
 
 // Mock that violates LSP - different behavior!
 @Injectable()
 export class MockPaymentService implements PaymentGateway {
-  async charge(amount: number, currency: string): Promise<PaymentResult> {
-    // VIOLATION 1: Throws for valid input (contract says return PaymentResult)
+  async charge({ amount, currency }: ChargeInput): Promise<Charge> {
+    // VIOLATION 1: Throws for valid input
     if (amount > 1000) {
       throw new Error('Mock does not support large amounts');
     }
 
-    // VIOLATION 2: Returns null instead of PaymentResult
-    if (currency !== 'USD') {
+    // VIOLATION 2: Returns null instead of a Charge
+    if (currency !== 'usd') {
       return null as any; // Real service would convert or reject properly
     }
 
-    // VIOLATION 3: Missing required field
-    return { success: true } as PaymentResult; // Missing transactionId!
-  }
-}
-
-// Consumer trusts the contract
-@Injectable()
-export class OrdersService {
-  constructor(@Inject(PAYMENT_GATEWAY) private payment: PaymentGateway) {}
-
-  async checkout(order: Order): Promise<void> {
-    const result = await this.payment.charge(order.total, order.currency);
-    // These fail with MockPaymentService:
-    await this.saveTransaction(result.transactionId); // undefined!
-    await this.sendReceipt(result); // might be null!
+    // VIOLATION 3: Missing required field, and a new charge on every call for the same order
+    return { amount } as Charge;
   }
 }
 ```
 
-**Correct (implementations honor the contract):**
+**Correct (one documented contract; every implementation honors it):**
 
 ```typescript
-// Well-defined interface with documented behavior
-interface PaymentGateway {
-  /**
-   * Charges the specified amount.
-   * @param amount - Amount in smallest currency unit (cents)
-   * @param currency - ISO 4217 currency code
-   * @returns PaymentResult with transactionId, success status, and amount
-   * @throws PaymentFailedException if charge is declined
-   * @throws InvalidCurrencyException if currency is not supported
-   */
-  charge(amount: number, currency: string): Promise<PaymentResult>;
-
-  /**
-   * Refunds a previous charge.
-   * @throws TransactionNotFoundException if transactionId is invalid
-   */
-  refund(transactionId: string, amount?: number): Promise<RefundResult>;
+// payments/payment-gateway.ts
+export interface ChargeInput {
+  orderId: string;
+  /** Smallest currency unit (cents). */
+  amount: number;
+  /** ISO 4217, lower case as Stripe uses it. */
+  currency: string;
 }
 
-// Production implementation
+export interface Charge {
+  chargeId: string;
+  amount: number;
+}
+
+export interface Refund {
+  refundId: string;
+  amount: number;
+}
+
+export interface PaymentGateway {
+  /**
+   * Charges at most once per orderId: a repeated orderId returns the first charge.
+   * @throws PaymentFailedException if the charge is declined
+   * @throws InvalidCurrencyException if the currency is not supported
+   */
+  charge(input: ChargeInput): Promise<Charge>;
+
+  /** @throws TransactionNotFoundException if chargeId is unknown */
+  refund(chargeId: string, amount?: number): Promise<Refund>;
+}
+
+export const PAYMENT_GATEWAY = Symbol('PAYMENT_GATEWAY');
+```
+
+```typescript
+// payments/stripe.service.ts
+import { Injectable } from '@nestjs/common';
+import Stripe from 'stripe';
+
+// Production implementation: the provider errors the contract names become its domain exceptions
 @Injectable()
 export class StripeService implements PaymentGateway {
-  async charge(amount: number, currency: string): Promise<PaymentResult> {
+  constructor(private readonly stripe: Stripe) {}
+
+  async charge({ orderId, amount, currency }: ChargeInput): Promise<Charge> {
     try {
-      const response = await this.stripe.charges.create({ amount, currency });
-      return {
-        success: true,
-        transactionId: response.id,
-        amount: response.amount,
-      };
+      // orderId is the idempotency key: Stripe answers a repeated key with the first request's result
+      const charge = await this.stripe.charges.create({ amount, currency, metadata: { orderId } }, { idempotencyKey: orderId });
+      return { chargeId: charge.id, amount: charge.amount };
     } catch (error) {
-      if (error.type === 'card_error') {
+      // `error` is unknown: narrow with the SDK's classes before reading any property
+      if (error instanceof Stripe.errors.StripeCardError) {
         throw new PaymentFailedException(error.message);
+      }
+      if (error instanceof Stripe.errors.StripeInvalidRequestError && error.param === 'currency') {
+        throw new InvalidCurrencyException(`Unsupported currency: ${currency}`);
+      }
+      throw error; // network, auth and rate-limit errors are not part of the contract
+    }
+  }
+
+  async refund(chargeId: string, amount?: number): Promise<Refund> {
+    try {
+      const refund = await this.stripe.refunds.create({ charge: chargeId, amount });
+      return { refundId: refund.id, amount: refund.amount };
+    } catch (error) {
+      if (error instanceof Stripe.errors.StripeInvalidRequestError && error.code === 'resource_missing') {
+        throw new TransactionNotFoundException(chargeId);
       }
       throw error;
     }
   }
-
-  async refund(transactionId: string, amount?: number): Promise<RefundResult> {
-    // Implementation...
-  }
 }
+```
 
-// Mock that honors LSP - same contract, same behavior shape
+```typescript
+// payments/mock-payment.service.ts
+// Mock that honors LSP: same contract, same failure modes, same idempotency
 @Injectable()
 export class MockPaymentService implements PaymentGateway {
-  private transactions = new Map<string, PaymentResult>();
+  private readonly charges = new Map<string, Charge>(); // by orderId, like the idempotency key
 
-  async charge(amount: number, currency: string): Promise<PaymentResult> {
-    // Honor the contract: validate currency like real service would
-    if (!['USD', 'EUR', 'GBP'].includes(currency)) {
+  async charge({ orderId, amount, currency }: ChargeInput): Promise<Charge> {
+    if (!['usd', 'eur', 'gbp'].includes(currency)) {
       throw new InvalidCurrencyException(`Unsupported currency: ${currency}`);
     }
-
-    // Simulate decline for specific test scenarios
     if (amount === 99999) {
       throw new PaymentFailedException('Card declined (test scenario)');
     }
+    const existing = this.charges.get(orderId);
+    if (existing) return existing;
 
-    // Return same shape as production
-    const result: PaymentResult = {
-      success: true,
-      transactionId: `mock_${Date.now()}_${Math.random().toString(36)}`,
-      amount,
-    };
-
-    this.transactions.set(result.transactionId, result);
-    return result;
+    const charge: Charge = { chargeId: `mock_ch_${this.charges.size + 1}`, amount };
+    this.charges.set(orderId, charge);
+    return charge;
   }
 
-  async refund(transactionId: string, amount?: number): Promise<RefundResult> {
-    // Honor the contract: throw if transaction not found
-    if (!this.transactions.has(transactionId)) {
-      throw new TransactionNotFoundException(transactionId);
+  async refund(chargeId: string, amount?: number): Promise<Refund> {
+    const charge = [...this.charges.values()].find((c) => c.chargeId === chargeId);
+    if (!charge) {
+      throw new TransactionNotFoundException(chargeId);
     }
-
-    return {
-      success: true,
-      refundId: `refund_${transactionId}`,
-      amount: amount ?? this.transactions.get(transactionId)!.amount,
-    };
-  }
-}
-
-// Consumer can swap implementations safely
-@Injectable()
-export class OrdersService {
-  constructor(@Inject(PAYMENT_GATEWAY) private payment: PaymentGateway) {}
-
-  async checkout(order: Order): Promise<Order> {
-    try {
-      const result = await this.payment.charge(order.total, order.currency);
-      // Works with both StripeService and MockPaymentService
-      order.transactionId = result.transactionId;
-      order.status = 'paid';
-      return order;
-    } catch (error) {
-      if (error instanceof PaymentFailedException) {
-        order.status = 'payment_failed';
-        return order;
-      }
-      throw error;
-    }
+    return { refundId: `refund_${chargeId}`, amount: amount ?? charge.amount };
   }
 }
 ```
@@ -1118,10 +1111,10 @@ export class OrdersService {
 **Testing LSP compliance:**
 
 ```typescript
-// Shared test suite that any implementation must pass
-function testPaymentGatewayContract(
-  createGateway: () => PaymentGateway,
-) {
+// test/payment-gateway.contract.ts: the suite every implementation must pass
+import { randomUUID } from 'node:crypto';
+
+export function testPaymentGatewayContract(createGateway: () => PaymentGateway) {
   describe('PaymentGateway contract', () => {
     let gateway: PaymentGateway;
 
@@ -1129,37 +1122,41 @@ function testPaymentGatewayContract(
       gateway = createGateway();
     });
 
-    it('returns PaymentResult with all required fields', async () => {
-      const result = await gateway.charge(1000, 'USD');
-      expect(result).toHaveProperty('success');
-      expect(result).toHaveProperty('transactionId');
-      expect(result).toHaveProperty('amount');
-      expect(typeof result.transactionId).toBe('string');
+    it('returns a charge with an id and the amount', async () => {
+      const charge = await gateway.charge({ orderId: randomUUID(), amount: 1000, currency: 'usd' });
+      expect(charge).toEqual({ chargeId: expect.any(String), amount: 1000 });
     });
 
-    it('throws InvalidCurrencyException for unsupported currency', async () => {
-      await expect(gateway.charge(1000, 'INVALID'))
-        .rejects.toThrow(InvalidCurrencyException);
+    it('returns the first charge for a repeated orderId', async () => {
+      const input = { orderId: randomUUID(), amount: 1000, currency: 'usd' };
+      const first = await gateway.charge(input);
+      await expect(gateway.charge(input)).resolves.toEqual(first);
     });
 
-    it('throws TransactionNotFoundException for invalid refund', async () => {
-      await expect(gateway.refund('nonexistent'))
-        .rejects.toThrow(TransactionNotFoundException);
+    it('throws InvalidCurrencyException for an unsupported currency', async () => {
+      await expect(gateway.charge({ orderId: randomUUID(), amount: 1000, currency: 'xxx' })).rejects.toThrow(InvalidCurrencyException);
+    });
+
+    it('throws TransactionNotFoundException for an unknown refund', async () => {
+      await expect(gateway.refund('ch_nonexistent')).rejects.toThrow(TransactionNotFoundException);
     });
   });
 }
 
-// Run against all implementations
-describe('StripeService', () => {
-  testPaymentGatewayContract(() => new StripeService(mockStripeClient));
-});
-
+// test/payments.e2e-spec.ts
 describe('MockPaymentService', () => {
   testPaymentGatewayContract(() => new MockPaymentService());
 });
+
+// Stripe test mode: needs network and a test key
+describe.skipIf(!process.env.STRIPE_TEST_KEY)('StripeService', () => {
+  testPaymentGatewayContract(() => new StripeService(new Stripe(process.env.STRIPE_TEST_KEY ?? '')));
+});
 ```
 
-Reference: [Liskov Substitution Principle](https://en.wikipedia.org/wiki/Liskov_substitution_principle)
+`CheckoutService` in `arch-single-responsibility` is the consumer: it charges with the order's id and works unchanged with either implementation. Stripe keeps an idempotency key for at least 24 hours and answers a repeat with the first result. Under `strict`, a `catch` variable is `unknown`, so `error.type === 'card_error'` fails with `TS18046: 'error' is of type 'unknown'`. In the probe (`stripe` 23.0.1, a fake `fetch` behind `Stripe.createFetchHttpClient()`), two charges for `ord_1` both sent `Idempotency-Key: ord_1`, where the old `charges.create({ amount, currency })` sent a fresh `stripe-node-retry-<uuid>` per call. A card decline became `PaymentFailedException: Your card was declined.`, `param: 'currency'` became `InvalidCurrencyException`, `resource_missing` on refund became `TransactionNotFoundException`, and a `StripeConnectionError` or a thrown string came out unchanged. `MockPaymentService` passed the contract suite; the Stripe suite is skipped without `STRIPE_TEST_KEY`.
+
+Reference: [Liskov Substitution Principle](https://en.wikipedia.org/wiki/Liskov_substitution_principle), [Stripe Idempotent requests](https://docs.stripe.com/api/idempotent_requests)
 
 ---
 
@@ -1208,40 +1205,23 @@ export class UsersService {
   }
 }
 
-// Testing is straightforward
-describe('UsersService', () => {
-  let service: UsersService;
-  let mockRepo: Mocked<UserRepository>; // import type { Mocked } from 'vitest'
-
-  beforeEach(() => {
-    mockRepo = {
-      find: vi.fn(),
-      save: vi.fn(),
-    } as unknown as Mocked<UserRepository>;
-
-    service = new UsersService(mockRepo, { dbUrl: 'test' });
-  });
-
-  it('should find all users', async () => {
-    mockRepo.find.mockResolvedValue([{ id: '1', name: 'Test' }]);
-    const result = await service.findAll();
-    expect(result).toHaveLength(1);
-  });
-});
-
 // Only use property injection for optional dependencies
 @Injectable()
-export class LoggingService {
+export class EventRecorder {
+  private readonly logger = new Logger(EventRecorder.name);
+
   @Optional()
   @Inject('ANALYTICS')
   private analytics?: AnalyticsService;
 
-  log(message: string) {
-    console.log(message);
-    this.analytics?.track('log', message); // Optional enhancement
+  record(event: string) {
+    this.logger.debug('Event recorded', { event });
+    this.analytics?.track(event); // Optional enhancement
   }
 }
 ```
+
+Every dependency the constructor lists is one `useMocker()` can supply, so a unit test compiles `Test.createTestingModule({ providers: [UsersService] }).useMocker(autoMock)` and reads typed mocks with `vi.mocked(moduleRef.get(UserRepository))`; the `'CONFIG'` string token gets a specific double. How to write those tests is owned by `nestjs-testing` (`unit-automock-dependencies`, `unit-specific-doubles`).
 
 Reference: [NestJS Providers](https://docs.nestjs.com/providers)
 
@@ -1310,14 +1290,17 @@ export class RequestContextService {
 
 // Better: Use NestJS built-in request context
 import { REQUEST } from '@nestjs/core';
-import { Request } from 'express';
+import type { AuthenticatedRequest } from '../auth/authenticated-request.js'; // security-use-guards
 
 @Injectable({ scope: Scope.REQUEST })
 export class AuditService {
-  constructor(@Inject(REQUEST) private request: Request) {}
+  private readonly logger = new Logger(AuditService.name);
 
-  log(action: string) {
-    console.log(`User ${this.request.user?.id} performed ${action}`);
+  constructor(@Inject(REQUEST) private readonly request: AuthenticatedRequest) {}
+
+  record(action: string) {
+    // Opaque identifier only, never names or emails
+    this.logger.debug('Action performed', { userId: this.request.user?.id, action });
   }
 }
 
@@ -1326,11 +1309,13 @@ import { ClsService } from 'nestjs-cls';
 
 @Injectable() // Stays singleton!
 export class AuditService {
+  private readonly logger = new Logger(AuditService.name);
+
   constructor(private cls: ClsService) {}
 
-  log(action: string) {
+  record(action: string) {
     const userId = this.cls.get('userId');
-    console.log(`User ${userId} performed ${action}`);
+    this.logger.debug('Action performed', { userId, action });
   }
 }
 ```
@@ -1343,20 +1328,18 @@ Reference: [NestJS Injection Scopes](https://docs.nestjs.com/fundamentals/inject
 
 **Impact: HIGH** — Enables interface-based DI at runtime
 
-TypeScript interfaces are erased at compile time and can't be used as injection tokens. Use string tokens, symbols, or abstract classes when you want to inject implementations of interfaces. This enables swapping implementations for testing or different environments.
+TypeScript interfaces are erased at compile time and can't be used as injection tokens. Use string tokens, symbols, or abstract classes when you want to inject implementations of interfaces. The token is also the seam tests replace: the module always registers the production implementation, and a test overrides the token.
 
 **Incorrect (interface can't be used as token):**
 
 ```typescript
 // Interface can't be used as injection token
 interface PaymentGateway {
-  charge(amount: number): Promise<PaymentResult>;
+  charge(input: ChargeInput): Promise<Charge>;
 }
 
 @Injectable()
-export class StripeService implements PaymentGateway {
-  charge(amount: number) { /* ... */ }
-}
+export class StripeService implements PaymentGateway { /* ... */ }
 
 @Injectable()
 export class OrdersService {
@@ -1369,70 +1352,47 @@ export class OrdersService {
 
 ```typescript
 // Option 1: String/Symbol tokens (most flexible)
+// payments/payment-gateway.ts: the contract and StripeService are in di-liskov-substitution
 export const PAYMENT_GATEWAY = Symbol('PAYMENT_GATEWAY');
 
 export interface PaymentGateway {
-  charge(amount: number): Promise<PaymentResult>;
+  charge(input: ChargeInput): Promise<Charge>;
+  refund(chargeId: string, amount?: number): Promise<Refund>;
 }
 
-@Injectable()
-export class StripeService implements PaymentGateway {
-  async charge(amount: number): Promise<PaymentResult> {
-    // Stripe implementation
-  }
-}
-
-@Injectable()
-export class MockPaymentService implements PaymentGateway {
-  async charge(amount: number): Promise<PaymentResult> {
-    return { success: true, id: 'mock-id' };
-  }
-}
-
-// Module registration
+// Module registration: always the production implementation
 @Module({
-  providers: [
-    {
-      provide: PAYMENT_GATEWAY,
-      useClass: process.env.NODE_ENV === 'test'
-        ? MockPaymentService
-        : StripeService,
-    },
-  ],
+  providers: [{ provide: PAYMENT_GATEWAY, useClass: StripeService }],
   exports: [PAYMENT_GATEWAY],
 })
 export class PaymentModule {}
 
 // Injection
 @Injectable()
-export class OrdersService {
-  constructor(
-    @Inject(PAYMENT_GATEWAY) private payment: PaymentGateway,
-  ) {}
-
-  async createOrder(dto: CreateOrderDto) {
-    await this.payment.charge(dto.amount);
-  }
+export class CheckoutService {
+  constructor(@Inject(PAYMENT_GATEWAY) private readonly payments: PaymentGateway) {}
 }
+
+// test/checkout.e2e-spec.ts: the test replaces the token, the module graph stays production
+const gateway = { charge: vi.fn(async ({ orderId, amount }: ChargeInput) => ({ chargeId: `ch_${orderId}`, amount })) };
+app = await createTestApp((builder) => builder.overrideProvider(PAYMENT_GATEWAY).useValue(gateway));
 
 // Option 2: Abstract class (carries runtime type info)
 export abstract class PaymentGateway {
-  abstract charge(amount: number): Promise<PaymentResult>;
+  abstract charge(input: ChargeInput): Promise<Charge>;
+  abstract refund(chargeId: string, amount?: number): Promise<Refund>;
 }
 
-@Injectable()
-export class StripeService extends PaymentGateway {
-  async charge(amount: number): Promise<PaymentResult> {
-    // Implementation
-  }
-}
-
+// StripeService then `extends PaymentGateway` instead of `implements` it
+// providers: [{ provide: PaymentGateway, useClass: StripeService }]
 // No @Inject needed with abstract class
 @Injectable()
-export class OrdersService {
-  constructor(private payment: PaymentGateway) {}
+export class CheckoutService {
+  constructor(private readonly payments: PaymentGateway) {}
 }
 ```
+
+A `process.env.NODE_ENV === 'test' ? Mock : Real` switch puts test code in the production graph, reads the environment behind `ConfigService`'s back, and leaves the e2e suite testing a module graph production never runs. Replace the token per suite instead; with the override above, the probe's checkout suite charged through `gateway` while every other provider stayed real. When a deployment genuinely selects an implementation (two payment providers), pick it in a `useFactory` that reads a validated setting with `config.getOrThrow()`, never a test double. Test structure: `nestjs-testing` (`e2e-real-app-module`).
 
 Reference: [NestJS Custom Providers](https://docs.nestjs.com/fundamentals/custom-providers)
 
@@ -1444,9 +1404,9 @@ Reference: [NestJS Custom Providers](https://docs.nestjs.com/fundamentals/custom
 
 ### 3.1 Handle Async Errors Properly
 
-**Impact: HIGH** — Prevents process crashes from unhandled rejections
+**Impact: HIGH** — Lost work and silent process deaths from unhandled rejections
 
-NestJS automatically catches errors from async route handlers, but errors from background tasks, event handlers, and manually created promises can crash your application. Always handle async errors explicitly and use global handlers as a safety net.
+NestJS catches errors from async route handlers, but a promise nobody awaits (fire-and-forget calls, un-awaited work inside event handlers) rejects with no one listening, and Node ends the process on an unhandled rejection. Every promise is awaited, or handed to a `dispatch()` that ends it in its own `catch` and tracks it so tests and shutdown can `drain()` it. The process-level handlers are a last resort that make the crash visible as one structured log line; they never keep the process running. Log levels and call shape: `nestjs-logging`.
 
 **Incorrect (fire-and-forget without error handling):**
 
@@ -1455,9 +1415,9 @@ NestJS automatically catches errors from async route handlers, but errors from b
 @Injectable()
 export class UsersService {
   async createUser(dto: CreateUserDto): Promise<User> {
-    const user = await this.repo.save(dto);
+    const user = await this.usersRepo.insert(dto);
 
-    // Fire and forget - if this fails, error is unhandled!
+    // Fire and forget - if this fails, the rejection is unhandled and ends the process
     this.emailService.sendWelcome(user.email);
 
     return user;
@@ -1469,97 +1429,108 @@ export class UsersService {
 export class OrdersService {
   @OnEvent('order.created')
   handleOrderCreated(event: OrderCreatedEvent) {
-    // This returns a promise but it's not awaited!
+    // Not awaited: the emitter can't see the rejection either, so it is unhandled
     this.processOrder(event);
-    // Errors will crash the process
-  }
-
-  private async processOrder(event: OrderCreatedEvent): Promise<void> {
-    await this.inventoryService.reserve(event.items);
-    await this.notificationService.send(event.userId);
   }
 }
 
-// Missing try-catch in scheduled tasks
+// Scheduled task that leaves failures to the scheduler
 @Cron('0 0 * * *')
 async dailyCleanup(): Promise<void> {
-  await this.cleanupService.run();
-  // If this throws, no error handling
+  await this.cleanup.run();
+  // @nestjs/schedule catches the rejection and keeps the schedule, but logs
+  // only the error message under context 'Scheduler': no job name, no item ids
 }
+
+// main.ts: log-and-continue keeps serving after an unknown failure
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled rejection', reason);
+});
 ```
 
 **Correct (explicit async error handling):**
 
 ```typescript
-// Handle fire-and-forget with explicit catch
+// Fire-and-forget through a dispatcher: dispatch() returns void, tracks the promise for drain()
+// and ends it in a terminal .catch (nestjs-resilience rule dlq-record-final-failure)
 @Injectable()
 export class UsersService {
-  private readonly logger = new Logger(UsersService.name);
+  constructor(
+    private readonly usersRepo: UsersRepository,
+    private readonly welcomeMail: WelcomeMailDispatcher,
+  ) {}
 
   async createUser(dto: CreateUserDto): Promise<User> {
-    const user = await this.repo.save(dto);
-
-    // Explicitly catch and log errors
-    this.emailService.sendWelcome(user.email).catch((error) => {
-      this.logger.error('Failed to send welcome email', error.stack);
-      // Optionally queue for retry
-    });
-
+    const user = await this.usersRepo.insert(dto);
+    this.welcomeMail.dispatch(user.id); // never rejects; the response doesn't wait
     return user;
   }
 }
 
-// Properly handle async event handlers
+// Event handler: await the work, keep what failed for replay
 @Injectable()
-export class OrdersService {
-  private readonly logger = new Logger(OrdersService.name);
+export class OrderCreatedListener {
+  private readonly logger = new Logger(OrderCreatedListener.name);
+
+  constructor(
+    private readonly processor: OrderProcessor,
+    private readonly deadLetters: DeadLetterStore, // nestjs-resilience dlq-record-final-failure
+  ) {}
 
   @OnEvent('order.created')
   async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
     try {
-      await this.processOrder(event);
+      await this.processor.process(event);
     } catch (error) {
-      this.logger.error('Failed to process order', { event, error });
-      // Don't rethrow - would crash the process
-      await this.deadLetterQueue.add('order.created', event);
+      const err = error instanceof Error ? error : new Error(String(error));
+      const key = `order.created:${event.orderId}`;
+      await this.deadLetters.record({ key, attempts: 1, lastError: err.message, failedAt: new Date(), payload: event });
+      this.logger.log('Dead letter recorded', { key }, err);
     }
   }
 }
 
-// Safe scheduled tasks
+// Scheduled tasks: catch to log with the job's context
+// (per-item handling: `nestjs-schedule` rule `job-handle-errors`)
 @Injectable()
-export class CleanupService {
-  private readonly logger = new Logger(CleanupService.name);
+export class CleanupJob {
+  private readonly logger = new Logger(CleanupJob.name);
 
-  @Cron('0 0 * * *')
+  constructor(private readonly cleanup: CleanupService) {}
+
+  @Cron('0 0 * * *', { name: 'daily-cleanup' })
   async dailyCleanup(): Promise<void> {
     try {
-      await this.cleanupService.run();
+      await this.cleanup.run();
       this.logger.log('Daily cleanup completed');
     } catch (error) {
-      this.logger.error('Daily cleanup failed', error.stack);
-      // Alert or retry logic
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.logger.error('Daily cleanup failed', { job: 'daily-cleanup' }, err);
     }
   }
 }
-
-// Global unhandled rejection handler in main.ts
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  const logger = new Logger('Bootstrap');
-
-  process.on('unhandledRejection', (reason, promise) => {
-    logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  });
-
-  process.on('uncaughtException', (error) => {
-    logger.error('Uncaught Exception:', error);
-    process.exit(1);
-  });
-
-  await app.listen(3000);
-}
 ```
+
+```typescript
+// src/main.ts: the handlers, registered before NestFactory.create and logging through the instance create() gets
+// (whole file and logger options: nestjs-logging rule setup-json-console-logger)
+const logger = new ConsoleLogger({ json: true, redact: ['password', 'token', 'authorization', 'cookie'] });
+const toError = (thrown: unknown): Error => (thrown instanceof Error ? thrown : new Error(String(thrown)));
+process.on('uncaughtException', (thrown) => {
+  logger.fatal('Uncaught exception', { source: 'process' }, toError(thrown));
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  logger.fatal('Unhandled rejection', { source: 'process' }, toError(reason));
+  process.exit(1);
+});
+
+const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger });
+```
+
+`@OnEvent` listeners default to `suppressErrors: true` in `@nestjs/event-emitter`: a listener that rejects is caught and logged by the emitter (`error`, context `Event`, the error's message and stack), and the emitting code never sees it. A rethrow therefore doesn't crash the process; it loses the event with one log line. The listener above keeps the event as a dead letter instead. In the probe the failing `process()` left one dead letter and logged `log` `Dead letter recorded` `{"key":"order.created:o1"}` with the error; when the store's `record()` rejected (`dead-letter table locked`), that rejection was the one the emitter logged, and nothing was recorded, so the store needs to be durable (`nestjs-resilience`). Use `{ suppressErrors: false }` only when the emitter awaits `emitAsync()` and owns the failure (`arch-use-events`).
+
+After an unhandled rejection or uncaught exception, the process state is unknown, so both handlers log at `fatal` and exit with code 1, as Node itself would. What they add is visibility: the crash becomes one JSON line instead of a raw stack trace. Register them before `NestFactory.create` so a failure while the app is being created is covered. In the probe, a provider constructor that left a rejected promise behind logged `{"level":"fatal",…,"message":"Unhandled rejection","error":{"name":"Error","message":"cache warmup failed",…},"params":{"source":"process"}}` and exited with code 1. A provider that throws is different: with Nest's default `abortOnError`, Nest logs it under `ExceptionHandler` and exits with code 1 whichever order the handlers are in.
 
 Reference: [Node.js Unhandled Rejections](https://nodejs.org/api/process.html#event-unhandledrejection)
 
@@ -1605,39 +1576,38 @@ export class UsersController {
 // Throw exceptions directly from service
 @Injectable()
 export class UsersService {
-  constructor(private readonly repo: UserRepository) {}
+  constructor(private readonly usersRepo: UsersRepository) {}
 
   async findById(id: string): Promise<User> {
-    const user = await this.repo.findOne({ where: { id } });
-    if (!user) {
-      throw new NotFoundException(`User #${id} not found`);
-    }
+    const user = await this.usersRepo.findById(id);
+    if (!user) throw new NotFoundException('User not found'); // no client input echoed (security-sanitize-output)
     return user;
   }
 
   async create(dto: CreateUserDto): Promise<User> {
-    const existing = await this.repo.findOne({
-      where: { email: dto.email },
-    });
-    if (existing) {
-      throw new ConflictException('Email already registered');
+    try {
+      return await this.usersRepo.insert({ email: dto.email, name: dto.name });
+    } catch (error) {
+      if (isUniqueViolation(error)) throw new ConflictException('Email already registered');
+      throw error;
     }
-    return this.repo.save(dto);
   }
 
   async update(id: string, dto: UpdateUserDto): Promise<User> {
-    const user = await this.findById(id); // Throws if not found
-    Object.assign(user, dto);
-    return this.repo.save(user);
+    const user = await this.usersRepo.update(id, dto); // null when no row matched
+    if (!user) throw new NotFoundException('User not found');
+    return user;
   }
 }
 
 // Controller stays thin
 @Controller('users')
 export class UsersController {
+  constructor(private readonly usersService: UsersService) {}
+
   @Get(':id')
-  findOne(@Param('id') id: string): Promise<User> {
-    return this.usersService.findById(id);
+  findOne(@Param() params: UserIdParamDto): Promise<User> {
+    return this.usersService.findById(params.id);
   }
 
   @Post()
@@ -1649,29 +1619,23 @@ export class UsersController {
 // For layer-agnostic services, use domain exceptions
 export class EntityNotFoundException extends Error {
   constructor(
-    public readonly entity: string,
-    public readonly id: string,
+    readonly entity: string,
+    readonly id: string,
   ) {
-    super(`${entity} with ID "${id}" not found`);
+    super(`${entity} not found`);
   }
 }
 
-// Map to HTTP in exception filter
+// Map to HTTP in an exception filter (error-use-exception-filters)
 @Catch(EntityNotFoundException)
-export class EntityNotFoundFilter implements ExceptionFilter {
-  catch(exception: EntityNotFoundException, host: ArgumentsHost) {
-    const ctx = host.switchToHttp();
-    const response = ctx.getResponse<Response>();
-
-    response.status(404).json({
-      statusCode: 404,
-      message: exception.message,
-      entity: exception.entity,
-      id: exception.id,
-    });
+export class EntityNotFoundFilter extends BaseExceptionFilter {
+  override catch(exception: EntityNotFoundException, host: ArgumentsHost): void {
+    super.catch(new NotFoundException(exception.message, { cause: exception }), host);
   }
 }
 ```
+
+`UsersRepository` writes through `TransactionRunner` (`arch-use-repository-pattern`); the duplicate check is the unique index, not a pre-read (`nestjs-typeorm` rule `orm-unique-violation`). In the probe a duplicate email answered `409 {"message":"Email already registered","error":"Conflict","statusCode":409}` and `PATCH` on an unknown id answered 404.
 
 Reference: [NestJS Exception Filters](https://docs.nestjs.com/exception-filters)
 
@@ -1681,7 +1645,7 @@ Reference: [NestJS Exception Filters](https://docs.nestjs.com/exception-filters)
 
 **Impact: HIGH** — Consistent, centralized error handling
 
-Never catch exceptions and manually format error responses in controllers. Use NestJS exception filters to handle errors consistently across your application. Create custom exception filters for specific error types and a global filter for unhandled exceptions.
+Never catch exceptions and manually format error responses in controllers. Throw exceptions and let filters turn them into responses. Custom filters map specific error types; one catch-all logs every failed request. Filters extend `BaseExceptionFilter` and hand it an `HttpException`, so the body is Nest's `getResponse()` (validation messages included) and every filter answers in the same shape. Log levels and call shape: `nestjs-logging`.
 
 **Incorrect (manual error handling in controllers):**
 
@@ -1701,7 +1665,6 @@ export class UsersController {
       }
       return res.json(user);
     } catch (error) {
-      console.error(error);
       return res.status(500).json({
         statusCode: 500,
         message: 'Internal server error',
@@ -1711,105 +1674,93 @@ export class UsersController {
 }
 ```
 
-**Correct (exception filters with consistent handling):**
+**Incorrect (catch-all that rebuilds the body from `exception.message`):**
 
 ```typescript
-// Use built-in and custom exceptions
-@Controller('users')
-export class UsersController {
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<User> {
-    const user = await this.usersService.findById(id);
-    if (!user) {
-      throw new NotFoundException(`User #${id} not found`);
-    }
-    return user;
-  }
-}
-
-// Custom domain exception
-export class UserNotFoundException extends NotFoundException {
-  constructor(userId: string) {
-    super({
-      statusCode: 404,
-      error: 'Not Found',
-      message: `User with ID "${userId}" not found`,
-      code: 'USER_NOT_FOUND',
-    });
-  }
-}
-
-// Custom exception filter for domain errors
-@Catch(DomainException)
-export class DomainExceptionFilter implements ExceptionFilter {
-  catch(exception: DomainException, host: ArgumentsHost) {
-    const ctx = host.switchToHttp();
-    const response = ctx.getResponse<Response>();
-    const request = ctx.getRequest<Request>();
-
-    const status = exception.getStatus?.() || 400;
-
-    response.status(status).json({
-      statusCode: status,
-      code: exception.code,
-      message: exception.message,
-      timestamp: new Date().toISOString(),
-      path: request.url,
-    });
-  }
-}
-
-// Global exception filter for unhandled errors
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
-  constructor(private readonly logger: Logger) {}
-
   catch(exception: unknown, host: ArgumentsHost) {
-    const ctx = host.switchToHttp();
-    const response = ctx.getResponse<Response>();
-    const request = ctx.getRequest<Request>();
+    const status = exception instanceof HttpException ? exception.getStatus() : 500;
+    const message = exception instanceof HttpException ? exception.message : 'Internal server error';
+    host.switchToHttp().getResponse<Response>().status(status).json({ statusCode: status, message });
+    // A ValidationPipe 400 answers "Bad Request Exception": the violations live in getResponse()
+  }
+}
+```
 
-    const status =
-      exception instanceof HttpException
-        ? exception.getStatus()
-        : HttpStatus.INTERNAL_SERVER_ERROR;
+**Correct (exceptions in code, filters that delegate the response to `BaseExceptionFilter`):**
 
-    const message =
-      exception instanceof HttpException
-        ? exception.message
-        : 'Internal server error';
+```typescript
+// Throw built-in or custom HTTP exceptions; no response handling in controllers
+@Controller('users')
+export class UsersController {
+  constructor(private readonly usersService: UsersService) {}
 
-    this.logger.error(
-      `${request.method} ${request.url}`,
-      exception instanceof Error ? exception.stack : exception,
-    );
+  @Get(':id')
+  findOne(@Param() params: UserIdParamDto): Promise<User> {
+    return this.usersService.findById(params.id); // throws NotFoundException
+  }
+}
+```
 
-    response.status(status).json({
-      statusCode: status,
-      message,
-      timestamp: new Date().toISOString(),
-      path: request.url,
-    });
+```typescript
+// errors/filters.ts
+import { type ArgumentsHost, Catch, HttpException, HttpStatus, InternalServerErrorException, Logger } from '@nestjs/common';
+import { BaseExceptionFilter } from '@nestjs/core';
+import type { Request } from 'express';
+
+export class DomainException extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly status: HttpStatus = HttpStatus.UNPROCESSABLE_ENTITY,
+  ) {
+    super(message);
   }
 }
 
-// Register globally in main.ts
-app.useGlobalFilters(
-  new AllExceptionsFilter(app.get(Logger)),
-  new DomainExceptionFilter(),
-);
+/** Domain errors are expected outcomes: mapped to their status, not logged. */
+@Catch(DomainException)
+export class DomainExceptionFilter extends BaseExceptionFilter {
+  override catch(exception: DomainException, host: ArgumentsHost): void {
+    const body = { statusCode: exception.status, code: exception.code, message: exception.message };
+    super.catch(new HttpException(body, exception.status, { cause: exception }), host);
+  }
+}
 
-// Or via module
-@Module({
-  providers: [
-    {
-      provide: APP_FILTER,
-      useClass: AllExceptionsFilter,
-    },
-  ],
-})
-export class AppModule {}
+/** Logs every failed request once; Nest's BaseExceptionFilter writes the response. */
+@Catch()
+export class AllExceptionsFilter extends BaseExceptionFilter {
+  private readonly logger = new Logger(AllExceptionsFilter.name);
+
+  override catch(exception: unknown, host: ArgumentsHost): void {
+    const request = host.switchToHttp().getRequest<Request>();
+    // Unknown errors answer a generic 500; the original stays in `cause` and in the log
+    const httpException =
+      exception instanceof HttpException ? exception : new InternalServerErrorException(undefined, { cause: exception });
+    const statusCode = httpException.getStatus();
+    const fields = { method: request.method, path: request.path, statusCode };
+
+    if (statusCode >= 500) {
+      const err = exception instanceof Error ? exception : new Error(String(exception));
+      this.logger.error('Request failed', fields, err);
+    } else {
+      this.logger.debug('Request rejected', fields);
+    }
+    super.catch(httpException, host); // body = getResponse(): validation messages survive
+  }
+}
 ```
+
+```typescript
+// app.module.ts providers: APP_FILTER, so e2e apps get them too (nestjs-testing e2e-global-enhancers-as-providers).
+// Nest tries the last-listed filter first and runs only the first whose @Catch matches: the catch-all goes first.
+{ provide: APP_FILTER, useClass: AllExceptionsFilter },
+{ provide: APP_FILTER, useClass: DomainExceptionFilter },
+{ provide: APP_FILTER, useClass: HttpClientExceptionFilter }, // nestjs-http-client request-exception-filter
+```
+
+Measured through the real `AppModule` with the `ValidationPipe` as `APP_PIPE`: `{ name: 42 }` answered `400 {"message":["name must be a string"],"error":"Bad Request","statusCode":400}`; `NotFoundException('User not found')` kept its body; a plain `Error` answered `500 {"message":"Internal Server Error","statusCode":500}` and logged one `error` `Request failed` with the fields and the error; a `DomainException` answered `422 {"statusCode":422,"code":"ORDER_SHIPPED",…}`. An `HttpNetworkError` answered `502` and an `HttpTimeoutError` `504` through `HttpClientExceptionFilter`, which logs those itself. With the catch-all listed last, the same `HttpNetworkError` answered `500`: the catch-all matched first and the gateway mapping never ran. Wrapping unknown errors in `InternalServerErrorException` keeps `BaseExceptionFilter` from logging them a second time under `ExceptionsHandler`. `HttpClientExceptionFilter` and `toHttpException()` are owned by `nestjs-http-client`.
 
 Reference: [NestJS Exception Filters](https://docs.nestjs.com/exception-filters)
 
@@ -1819,16 +1770,15 @@ Reference: [NestJS Exception Filters](https://docs.nestjs.com/exception-filters)
 
 **Section Impact: HIGH**
 
-### 4.1 Implement Secure JWT Authentication
+### 4.1 Issue and Verify Short-Lived JWT Access Tokens
 
-**Impact: CRITICAL** — Essential for secure APIs
+**Impact: CRITICAL** — Forged, stale or over-privileged tokens accepted
 
-Use `@nestjs/jwt` with `@nestjs/passport` for authentication. Store secrets securely, use appropriate token lifetimes, implement refresh tokens, and validate tokens properly. Never expose sensitive data in JWT payloads.
+Use `@nestjs/jwt` to sign access tokens and `@nestjs/passport` with `passport-jwt` to verify them. Read every required setting with `ConfigService.getOrThrow()`, so a missing secret stops the app at startup instead of failing at the first `sign()`; `get()` returns `undefined`, and an `undefined` issuer or audience silently turns that check off. Keep tokens short-lived and the payload to identifiers. `JwtStrategy.validate()` loads the user on every request, so deactivation, demotion and "sign out everywhere" take effect immediately. This rule covers access tokens only. Refresh tokens need their own atomic rotation contract (hashed one-time secrets, expiry and revocation checks, single-use replacement, family revocation on reuse); a `save()` of a hashed random string is not one, so don't issue refresh tokens until you implement that contract in full.
 
-**Incorrect (insecure JWT implementation):**
+**Incorrect (hardcoded secret, sensitive payload, no user check):**
 
 ```typescript
-// Hardcode secrets
 @Module({
   imports: [
     JwtModule.register({
@@ -1839,25 +1789,21 @@ Use `@nestjs/jwt` with `@nestjs/passport` for authentication. Store secrets secu
 })
 export class AuthModule {}
 
-// Store sensitive data in JWT
 async login(user: User): Promise<{ accessToken: string }> {
   const payload = {
     sub: user.id,
-    email: user.email,
-    password: user.password, // NEVER include password!
-    ssn: user.ssn, // NEVER include sensitive data!
-    isAdmin: user.isAdmin, // Can be tampered if not verified
+    email: user.email, // personal data, readable by anyone holding the token
+    roles: user.roles, // stays valid after the user is demoted
   };
   return { accessToken: this.jwtService.sign(payload) };
 }
 
-// Skip token validation
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
-  constructor() {
+  constructor(config: ConfigService) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-      secretOrKey: 'my-secret',
+      secretOrKey: config.get('JWT_SECRET'), // undefined when unset; issuer/audience never checked
     });
   }
 
@@ -1867,99 +1813,108 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 }
 ```
 
-**Correct (secure JWT with refresh tokens):**
+**Correct (validated settings, identifier-only payload, user loaded per request):**
 
 ```typescript
-// Secure JWT configuration
+// auth/auth.module.ts
+import { Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { JwtModule } from '@nestjs/jwt';
+import { PassportModule } from '@nestjs/passport';
+import { UsersModule } from '../users/users.module.js';
+import { AuthService } from './auth.service.js';
+import { JwtStrategy } from './jwt.strategy.js';
+
 @Module({
   imports: [
+    UsersModule,
+    PassportModule,
     JwtModule.registerAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
+      inject: [ConfigService], // ConfigModule.forRoot({ isGlobal: true }) in AppModule
       useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_SECRET'),
+        secret: config.getOrThrow<string>('JWT_SECRET'),
         signOptions: {
+          algorithm: 'HS256',
           expiresIn: '15m', // Short-lived access tokens
-          issuer: config.get<string>('JWT_ISSUER'),
-          audience: config.get<string>('JWT_AUDIENCE'),
+          issuer: config.getOrThrow<string>('JWT_ISSUER'),
+          audience: config.getOrThrow<string>('JWT_AUDIENCE'),
         },
       }),
     }),
-    PassportModule.register({ defaultStrategy: 'jwt' }),
   ],
+  providers: [AuthService, JwtStrategy],
+  exports: [AuthService],
 })
 export class AuthModule {}
+```
 
-// Minimal JWT payload
-@Injectable()
-export class AuthService {
-  async login(user: User): Promise<TokenResponse> {
-    // Only include necessary, non-sensitive data
-    const payload: JwtPayload = {
-      sub: user.id,
-      email: user.email,
-      roles: user.roles,
-      iat: Math.floor(Date.now() / 1000),
-    };
-
-    const accessToken = this.jwtService.sign(payload);
-    const refreshToken = await this.createRefreshToken(user.id);
-
-    return { accessToken, refreshToken, expiresIn: 900 };
-  }
-
-  private async createRefreshToken(userId: string): Promise<string> {
-    const token = randomBytes(32).toString('hex');
-    const hashedToken = await bcrypt.hash(token, 10);
-
-    await this.refreshTokenRepo.save({
-      userId,
-      token: hashedToken,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
-    });
-
-    return token;
-  }
+```typescript
+// auth/auth.service.ts
+/** Identifiers only: no roles, no personal data. Roles are read from the database per request. */
+export interface AccessTokenPayload {
+  sub: string;
+  ver: number;
 }
 
-// Proper JWT strategy with validation
 @Injectable()
-export class JwtStrategy extends PassportStrategy(Strategy) {
-  constructor(
-    private config: ConfigService,
-    private usersService: UsersService,
-  ) {
-    super({
-      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-      secretOrKey: config.get<string>('JWT_SECRET'),
-      ignoreExpiration: false,
-      issuer: config.get<string>('JWT_ISSUER'),
-      audience: config.get<string>('JWT_AUDIENCE'),
-    });
-  }
+export class AuthService {
+  constructor(private readonly jwt: JwtService) {}
 
-  async validate(payload: JwtPayload): Promise<User> {
-    // Verify user still exists and is active
-    const user = await this.usersService.findById(payload.sub);
-
-    if (!user || !user.isActive) {
-      throw new UnauthorizedException('User not found or inactive');
-    }
-
-    // Verify token wasn't issued before password change
-    if (user.passwordChangedAt) {
-      const tokenIssuedAt = new Date(payload.iat * 1000);
-      if (tokenIssuedAt < user.passwordChangedAt) {
-        throw new UnauthorizedException('Token invalidated by password change');
-      }
-    }
-
-    return user;
+  /** Call only after the credentials have been verified. */
+  async issueAccessToken(user: User): Promise<{ accessToken: string; expiresIn: number }> {
+    const payload: AccessTokenPayload = { sub: user.id, ver: user.tokenVersion };
+    return { accessToken: await this.jwt.signAsync(payload), expiresIn: 900 };
   }
 }
 ```
 
-Reference: [NestJS Authentication](https://docs.nestjs.com/security/authentication)
+```typescript
+// users/users.repository.ts (arch-use-repository-pattern): the read that authorizes
+/** Committed state only: waits behind an open transaction instead of reading its uncommitted rows. */
+findCommittedById(id: string): Promise<User | null> {
+  return this.transactions.run((manager) => manager.findOneBy(User, { id }));
+}
+```
+
+```typescript
+// auth/jwt.strategy.ts
+import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PassportStrategy } from '@nestjs/passport';
+import { ExtractJwt, Strategy } from 'passport-jwt';
+import { UsersRepository } from '../users/users.repository.js';
+import type { AccessTokenPayload } from './auth.service.js';
+import type { AuthenticatedUser } from './authenticated-request.js';
+
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy) {
+  constructor(
+    config: ConfigService,
+    private readonly users: UsersRepository,
+  ) {
+    super({
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      secretOrKey: config.getOrThrow<string>('JWT_SECRET'),
+      issuer: config.getOrThrow<string>('JWT_ISSUER'),
+      audience: config.getOrThrow<string>('JWT_AUDIENCE'),
+      algorithms: ['HS256'],
+    });
+  }
+
+  /** Runs after the signature and expiry check; its return value becomes request.user. */
+  async validate(payload: AccessTokenPayload): Promise<AuthenticatedUser> {
+    // Committed read: a role change inside another request's open transaction is not visible until it commits
+    const user = await this.users.findCommittedById(payload.sub);
+    // Deleted, deactivated, or signed out everywhere (tokenVersion bumped) since the token was issued
+    if (!user?.isActive || user.tokenVersion !== payload.ver) throw new UnauthorizedException();
+    return { id: user.id, roles: user.roles, plan: user.plan };
+  }
+}
+```
+
+Without `JWT_SECRET`, `main.ts` stopped during `NestFactory.create` with `{"level":"error",…,"message":"Configuration key \"JWT_SECRET\" does not exist","context":"ExceptionHandler",…}` and exit code 1. `validate()` decides authorization, so it reads through `TransactionRunner.run()` (`nestjs-typeorm` rule `orm-atomic-writes`): a plain repository read on better-sqlite3 runs inside whatever transaction is open on the shared connection. In the probe, a member's token called an `@Roles(['admin'])` route while another transaction had set the user's roles to `['admin']` and then rolled back: with `findById` the request answered 200, with `findCommittedById` it waited for the rollback and answered 403. `tokenVersion` is an integer column incremented on password change, "sign out everywhere" and account recovery; comparing it is exact, where comparing `iat` (whole seconds) with a password-change timestamp misjudges tokens issued in the same second. `AuthenticatedUser` and the global `JwtAuthGuard` that runs this strategy are in `security-use-guards`. Secrets come from the environment or a secret manager, never from source; for HS256 use at least 32 random bytes.
+
+Reference: [NestJS Authentication: Passport JWT](https://docs.nestjs.com/recipes/passport#implementing-passport-jwt), [OWASP JSON Web Token Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html)
 
 ---
 
@@ -1967,120 +1922,99 @@ Reference: [NestJS Authentication](https://docs.nestjs.com/security/authenticati
 
 **Impact: HIGH** — Protects against abuse and ensures fair resource usage
 
-Use `@nestjs/throttler` to limit request rates per client. Apply different limits for different endpoints - stricter for auth endpoints, more relaxed for read operations. Consider using Redis for distributed rate limiting in clustered deployments.
+Use `@nestjs/throttler` to limit request rates per client, stricter on credential and email-sending endpoints than on reads. In `@nestjs/throttler` 6, per-user limits are configuration, not guard overrides: `limit` and `ttl` accept a function of the `ExecutionContext`, and `getTracker` decides who is counted. `ThrottlerGuard` has no `getLimit()` hook: in the probe, a subclass `getLimit()` returning 1000 was called 0 times, and the fourth request against the configured limit of 3 answered 429. Counting per user needs `request.user`, so the throttler guard runs after the authentication guard. The default storage is in-process memory: with several instances, every instance counts separately; use a shared storage (Redis) there.
 
-**Incorrect (no rate limiting on sensitive endpoints):**
+**Incorrect (no limits on sensitive endpoints; a limit hook that doesn't exist):**
 
 ```typescript
-// No rate limiting on sensitive endpoints
 @Controller('auth')
 export class AuthController {
   @Post('login')
-  async login(@Body() dto: LoginDto): Promise<TokenResponse> {
-    // Attackers can brute-force credentials
-    return this.authService.login(dto);
-  }
-
-  @Post('forgot-password')
-  async forgotPassword(@Body() dto: ForgotPasswordDto): Promise<void> {
-    // Can be abused to spam users with emails
-    return this.authService.sendResetEmail(dto.email);
+  login(@Body() dto: LoginDto): Promise<TokenResponse> {
+    return this.authService.login(dto); // Attackers can brute-force credentials
   }
 }
 
-// Same limits for all endpoints
-@UseGuards(ThrottlerGuard)
-@Controller('api')
-export class ApiController {
-  @Get('public-data')
-  async getPublic() {} // Should allow more requests
-
-  @Post('process-payment')
-  async payment() {} // Should be more restrictive
+@Injectable()
+export class CustomThrottlerGuard extends ThrottlerGuard {
+  protected async getLimit(context: ExecutionContext): Promise<number> {
+    return context.switchToHttp().getRequest().user?.isPremium ? 1000 : 200; // never called
+  }
 }
 ```
 
-**Correct (configured throttler with endpoint-specific limits):**
+**Correct (resolvable limit and tracker, guard after authentication):**
 
 ```typescript
-// Configure throttler globally with multiple limits
-import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+// auth/throttling.ts
+import type { ExecutionContext } from '@nestjs/common';
+import type { AuthenticatedRequest } from './authenticated-request.js';
 
+const requestOf = (context: ExecutionContext) => context.switchToHttp().getRequest<AuthenticatedRequest>();
+
+/** Requests per minute: premium accounts 1000, other accounts 200, anonymous callers 50. */
+export function limitFor(context: ExecutionContext): number {
+  const { user } = requestOf(context);
+  if (!user) return 50;
+  return user.plan === 'premium' ? 1000 : 200;
+}
+
+/** Signed-in callers are counted per account, anonymous callers per IP. */
+export function trackerFor(_req: Record<string, unknown>, context: ExecutionContext): string {
+  const request = requestOf(context);
+  return request.user ? `user:${request.user.id}` : `ip:${request.ip}`;
+}
+```
+
+```typescript
+// app.module.ts
 @Module({
   imports: [
-    ThrottlerModule.forRoot([
-      {
-        name: 'short',
-        ttl: 1000, // 1 second
-        limit: 3, // 3 requests per second
-      },
-      {
-        name: 'medium',
-        ttl: 10000, // 10 seconds
-        limit: 20, // 20 requests per 10 seconds
-      },
-      {
-        name: 'long',
-        ttl: 60000, // 1 minute
-        limit: 100, // 100 requests per minute
-      },
-    ]),
+    ThrottlerModule.forRoot({
+      throttlers: [{ name: 'default', ttl: 60_000, limit: limitFor }],
+      getTracker: trackerFor,
+    }),
   ],
   providers: [
-    {
-      provide: APP_GUARD,
-      useClass: ThrottlerGuard,
-    },
+    // Global guards run in this order: authenticate, authorize, then throttle per account
+    { provide: APP_GUARD, useClass: JwtAuthGuard },
+    { provide: APP_GUARD, useClass: RolesGuard },
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
   ],
 })
 export class AppModule {}
 
-// Override limits per endpoint
+// Stricter limits per endpoint
 @Controller('auth')
 export class AuthController {
+  @Public()
   @Post('login')
-  @Throttle({ short: { limit: 5, ttl: 60000 } }) // 5 attempts per minute
-  async login(@Body() dto: LoginDto): Promise<TokenResponse> {
+  @Throttle({ default: { limit: 5, ttl: 60_000 } }) // 5 attempts per minute
+  login(@Body() dto: LoginDto): Promise<TokenResponse> {
     return this.authService.login(dto);
   }
 
+  @Public()
   @Post('forgot-password')
-  @Throttle({ short: { limit: 3, ttl: 3600000 } }) // 3 per hour
-  async forgotPassword(@Body() dto: ForgotPasswordDto): Promise<void> {
+  @Throttle({ default: { limit: 3, ttl: 3_600_000 } }) // 3 per hour
+  forgotPassword(@Body() dto: ForgotPasswordDto): Promise<void> {
     return this.authService.sendResetEmail(dto.email);
   }
 }
 
-// Skip throttling for certain routes
+// No throttling for probes
 @Controller('health')
 export class HealthController {
-  @Get()
+  @Public()
   @SkipThrottle()
-  check(): string {
-    return 'OK';
-  }
-}
-
-// Custom throttle per user type
-@Injectable()
-export class CustomThrottlerGuard extends ThrottlerGuard {
-  protected async getTracker(req: Request): Promise<string> {
-    // Use user ID if authenticated, IP otherwise
-    return req.user?.id || req.ip;
-  }
-
-  protected async getLimit(context: ExecutionContext): Promise<number> {
-    const request = context.switchToHttp().getRequest();
-
-    // Higher limits for authenticated users
-    if (request.user) {
-      return request.user.isPremium ? 1000 : 200;
-    }
-
-    return 50; // Anonymous users
+  @Get()
+  check(): { status: string } {
+    return { status: 'ok' };
   }
 }
 ```
+
+With `@nestjs/throttler` 6.7.1, the sixth `POST /auth/login` within a minute answered 429; an anonymous `GET` route answered 200 for the 50th request and 429 for the 51st, while a signed-in member made 60 requests to an authenticated route with no 429 and got `X-RateLimit-Limit: 200`. `@SkipThrottle()` `GET /health` never answered 429. Counters are per route and tracker. Behind a reverse proxy, `request.ip` is the proxy's address unless Express's `trust proxy` is set to the proxy hop count in `configureApp()`; without it every anonymous caller shares one counter. A per-IP login limit slows credential stuffing only partly; also count failed attempts per account in the login service. `AuthenticatedRequest`, `JwtAuthGuard` and `@Public()` are in `security-use-guards`.
 
 Reference: [NestJS Throttler](https://docs.nestjs.com/security/rate-limiting)
 
@@ -2090,7 +2024,7 @@ Reference: [NestJS Throttler](https://docs.nestjs.com/security/rate-limiting)
 
 **Impact: HIGH** — XSS vulnerabilities can compromise user sessions and data
 
-While NestJS APIs typically return JSON (which browsers don't execute), XSS risks exist when rendering HTML, storing user content, or when frontend frameworks improperly handle API responses. Sanitize user-generated content before storage and use proper Content-Type headers.
+While NestJS APIs typically return JSON (which browsers don't execute), XSS risks exist when rendering HTML, storing user content, or when frontend frameworks improperly handle API responses. Sanitize user-generated HTML before storage, keep client input out of messages, and send a Content-Security-Policy. Under the project's NodeNext ESM setup, `sanitize-html` is a default import: `import * as sanitizeHtml` fails to type-check with `TS2349: This expression is not callable` (`sanitize-html` 2.18.1, `@types/sanitize-html` 2.16.2).
 
 **Incorrect (storing raw HTML without sanitization):**
 
@@ -2102,7 +2036,7 @@ export class CommentsService {
     // User can inject: <script>steal(document.cookie)</script>
     return this.repo.save({
       content: dto.content, // Raw, unsanitized
-      authorId: dto.authorId,
+      authorId: dto.authorId, // and the author is whatever the client claims
     });
   }
 }
@@ -2129,79 +2063,80 @@ async findOne(@Param('id') id: string): Promise<User> {
   }
   return user;
 }
+
+// Sanitizer in a transform without a type guard: an array body field throws a TypeError -> 500
+@Transform(({ value }) => sanitizeHtml(value, { allowedTags: [] }))
+title: string;
 ```
 
-**Correct (sanitize content and use proper headers):**
+**Correct (sanitize content, guard transforms, send a CSP):**
 
 ```typescript
-// Sanitize HTML content before storage
-import * as sanitizeHtml from 'sanitize-html';
+// comments/comments.service.ts: sanitize HTML before storage
+import { Injectable } from '@nestjs/common';
+import sanitizeHtml from 'sanitize-html';
+import { TransactionRunner } from '../database/transaction-runner.js';
+import { Comment } from './comment.entity.js';
+
+export const COMMENT_HTML: sanitizeHtml.IOptions = {
+  allowedTags: ['b', 'i', 'em', 'strong', 'a', 'p', 'br'],
+  allowedAttributes: { a: ['href', 'title'] },
+  allowedSchemes: ['http', 'https', 'mailto'],
+};
 
 @Injectable()
 export class CommentsService {
-  private readonly sanitizeOptions: sanitizeHtml.IOptions = {
-    allowedTags: ['b', 'i', 'em', 'strong', 'a', 'p', 'br'],
-    allowedAttributes: {
-      a: ['href', 'title'],
-    },
-    allowedSchemes: ['http', 'https', 'mailto'],
-  };
+  constructor(private readonly transactions: TransactionRunner) {}
 
-  async create(dto: CreateCommentDto): Promise<Comment> {
-    return this.repo.save({
-      content: sanitizeHtml(dto.content, this.sanitizeOptions),
-      authorId: dto.authorId,
-    });
+  create(authorId: string, dto: CreateCommentDto): Promise<Comment> {
+    const content = sanitizeHtml(dto.content, COMMENT_HTML);
+    return this.transactions.run((manager) => manager.save(Comment, { authorId, content }));
   }
 }
 
-// Use validation pipe to strip HTML
+// comments/comments.controller.ts: the author is the authenticated user, not a body field
+@Post()
+create(@CurrentUser() user: AuthenticatedUser, @Body() dto: CreateCommentDto): Promise<Comment> {
+  return this.comments.create(user.id, dto);
+}
+```
+
+```typescript
+// posts/create-post.dto.ts: sanitize in the DTO; non-strings pass through to @IsString()
 import { Transform } from 'class-transformer';
+import { IsString, MaxLength } from 'class-validator';
+import sanitizeHtml from 'sanitize-html';
+import { COMMENT_HTML } from '../comments/comments.service.js';
+
+const stripAllHtml = ({ value }: { value: unknown }) =>
+  typeof value === 'string' ? sanitizeHtml(value, { allowedTags: [], allowedAttributes: {} }) : value;
 
 export class CreatePostDto {
   @IsString()
   @MaxLength(1000)
-  @Transform(({ value }) => sanitizeHtml(value, { allowedTags: [] }))
+  @Transform(stripAllHtml)
   title: string;
 
   @IsString()
-  @Transform(({ value }) =>
-    sanitizeHtml(value, {
-      allowedTags: ['p', 'br', 'b', 'i', 'a'],
-      allowedAttributes: { a: ['href'] },
-    }),
-  )
+  @Transform(({ value }) => (typeof value === 'string' ? sanitizeHtml(value, COMMENT_HTML) : value))
   content: string;
 }
+```
 
-// Set proper Content-Type headers
-@Controller('api')
-export class ApiController {
-  @Get('data')
-  @Header('Content-Type', 'application/json')
-  async getData(): Promise<DataResponse> {
-    // JSON response - browser won't execute scripts
-    return this.service.getData();
-  }
-}
-
-// Sanitize error messages
+```typescript
+// Fixed error messages; the param is validated before use
 @Get(':id')
-async findOne(@Param('id', ParseUUIDPipe) id: string): Promise<User> {
-  const user = await this.repo.findOne({ where: { id } });
-  if (!user) {
-    // UUID validation ensures safe format
-    throw new NotFoundException('User not found');
-  }
-  return user;
+findOne(@Param() params: UserIdParamDto): Promise<User> {
+  return this.usersService.findById(params.id); // throws NotFoundException('User not found')
 }
+```
 
-// Use Helmet for CSP headers
+```typescript
+// src/configure-app.ts (nestjs-testing): middleware has no provider form, so main.ts and e2e apps share it here
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import helmet from 'helmet';
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-
+export function configureApp(app: NestExpressApplication): NestExpressApplication {
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -2214,10 +2149,11 @@ async function bootstrap() {
       },
     }),
   );
-
-  await app.listen(3000);
+  return app.setGlobalPrefix('api');
 }
 ```
+
+In the probe, a comment `hi <script>steal()</script><b>there</b>` was stored as `hi <b>there</b>` with the token's user as author. `CreatePostDto` turned `<b>Hi</b><script>x()</script>` into `Hi` and `<p onclick="x()">ok <a href="javascript:x()">l</a></p>` into `<p>ok <a>l</a></p>`; an array `title` answered 400 (`title must be a string`) where the unguarded transform answered 500. Every response carried `content-security-policy: default-src 'self';…;script-src 'self';…`. Transforms run before validation, so each one returns non-strings unchanged (`security-validate-all-input`). Nest serializes returned objects as `application/json`; set `Content-Type: text/html` only on routes that render escaped HTML.
 
 Reference: [OWASP XSS Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html)
 
@@ -2227,9 +2163,9 @@ Reference: [OWASP XSS Prevention](https://cheatsheetseries.owasp.org/cheatsheets
 
 **Impact: HIGH** — Enforces access control before handlers execute
 
-Guards determine whether a request should be handled based on authentication state, roles, permissions, or other conditions. They run after middleware but before pipes and interceptors, making them ideal for access control. Use guards instead of manual checks in controllers.
+Guards decide whether a request reaches its handler. They run after middleware and before interceptors and pipes, which makes them the place for access control. Authenticate with Passport's `AuthGuard('jwt')`, so `JwtStrategy.validate()` (`security-auth-jwt`) loads the current user from the database on every request, and authorize from that server-side user. Roles copied into a token stay valid for the token's lifetime after the user is demoted or deactivated.
 
-**Incorrect (manual auth checks in every handler):**
+**Incorrect (manual checks; or a guard that trusts the token's claims):**
 
 ```typescript
 // Manual auth checks in every handler
@@ -2237,122 +2173,124 @@ Guards determine whether a request should be handled based on authentication sta
 export class AdminController {
   @Get('users')
   async getUsers(@Request() req) {
-    if (!req.user) {
-      throw new UnauthorizedException();
-    }
-    if (!req.user.roles.includes('admin')) {
-      throw new ForbiddenException();
-    }
+    if (!req.user) throw new UnauthorizedException();
+    if (!req.user.roles.includes('admin')) throw new ForbiddenException();
     return this.adminService.getUsers();
   }
+}
 
-  @Delete('users/:id')
-  async deleteUser(@Request() req, @Param('id') id: string) {
-    if (!req.user) {
-      throw new UnauthorizedException();
-    }
-    if (!req.user.roles.includes('admin')) {
-      throw new ForbiddenException();
-    }
-    return this.adminService.deleteUser(id);
+// Verified payload used as the user: roles come from the token, the user is never looked up
+@Injectable()
+export class JwtAuthGuard implements CanActivate {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest();
+    request.user = await this.jwtService.verifyAsync(extractBearer(request)); // { sub, roles: ['admin'] }
+    return true;
   }
 }
 ```
 
-**Correct (guards with declarative decorators):**
+**Correct (Passport guard, roles from the database user, declarative decorators):**
 
 ```typescript
-// JWT Auth Guard
+// auth/authenticated-request.ts
+import type { Request } from 'express';
+import type { Role } from '../users/user.entity.js';
+
+/** What JwtStrategy.validate() puts on request.user: loaded from the database on every request. */
+export interface AuthenticatedUser {
+  id: string;
+  roles: Role[];
+  plan: 'free' | 'premium';
+}
+
+export type AuthenticatedRequest = Request & { user?: AuthenticatedUser };
+```
+
+```typescript
+// auth/public.decorator.ts, auth/roles.decorator.ts, auth/current-user.decorator.ts
+export const IS_PUBLIC = 'isPublic';
+export const Public = () => SetMetadata(IS_PUBLIC, true);
+
+export const Roles = Reflector.createDecorator<Role[]>();
+
+/** The user JwtStrategy.validate() loaded for this request. */
+export const CurrentUser = createParamDecorator((_data: unknown, context: ExecutionContext): AuthenticatedUser => {
+  const { user } = context.switchToHttp().getRequest<AuthenticatedRequest>();
+  if (!user) throw new UnauthorizedException(); // only reachable on a @Public() route
+  return user;
+});
+```
+
+```typescript
+// auth/jwt-auth.guard.ts
+import { type ExecutionContext, Injectable } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import { AuthGuard } from '@nestjs/passport';
+import { IS_PUBLIC } from './public.decorator.js';
+
+/** Authenticates through JwtStrategy, so request.user is the current database user. */
 @Injectable()
-export class JwtAuthGuard implements CanActivate {
-  constructor(
-    private jwtService: JwtService,
-    private reflector: Reflector,
-  ) {}
-
-  async canActivate(context: ExecutionContext): Promise<boolean> {
-    // Check for @Public() decorator
-    const isPublic = this.reflector.getAllAndOverride<boolean>('isPublic', [
-      context.getHandler(),
-      context.getClass(),
-    ]);
-    if (isPublic) return true;
-
-    const request = context.switchToHttp().getRequest();
-    const token = this.extractToken(request);
-
-    if (!token) {
-      throw new UnauthorizedException('No token provided');
-    }
-
-    try {
-      request.user = await this.jwtService.verifyAsync(token);
-      return true;
-    } catch {
-      throw new UnauthorizedException('Invalid token');
-    }
+export class JwtAuthGuard extends AuthGuard('jwt') {
+  constructor(private readonly reflector: Reflector) {
+    super();
   }
 
-  private extractToken(request: Request): string | undefined {
-    const [type, token] = request.headers.authorization?.split(' ') ?? [];
-    return type === 'Bearer' ? token : undefined;
+  override canActivate(context: ExecutionContext) {
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC, [context.getHandler(), context.getClass()]);
+    return isPublic || super.canActivate(context);
   }
 }
 
-// Roles Guard
+// auth/roles.guard.ts
 @Injectable()
 export class RolesGuard implements CanActivate {
-  constructor(private reflector: Reflector) {}
+  constructor(private readonly reflector: Reflector) {}
 
   canActivate(context: ExecutionContext): boolean {
-    const requiredRoles = this.reflector.getAllAndOverride<Role[]>('roles', [
-      context.getHandler(),
-      context.getClass(),
-    ]);
-
-    if (!requiredRoles) return true;
-
-    const { user } = context.switchToHttp().getRequest();
-    return requiredRoles.some((role) => user.roles?.includes(role));
+    const required = this.reflector.getAllAndOverride(Roles, [context.getHandler(), context.getClass()]);
+    if (!required?.length) return true;
+    const { user } = context.switchToHttp().getRequest<AuthenticatedRequest>();
+    return !!user && required.some((role) => user.roles.includes(role));
   }
 }
+```
 
-// Decorators
-export const Public = () => SetMetadata('isPublic', true);
-export const Roles = (...roles: Role[]) => SetMetadata('roles', roles);
+```typescript
+// app.module.ts providers: global guards run in the order listed
+{ provide: APP_GUARD, useClass: JwtAuthGuard },
+{ provide: APP_GUARD, useClass: RolesGuard },
 
-// Register guards globally
-@Module({
-  providers: [
-    { provide: APP_GUARD, useClass: JwtAuthGuard },
-    { provide: APP_GUARD, useClass: RolesGuard },
-  ],
-})
-export class AppModule {}
-
-// Clean controller
+// admin/admin.controller.ts
 @Controller('admin')
-@Roles(Role.Admin) // Applied to all routes
+@Roles(['admin']) // Applied to all routes
 export class AdminController {
+  constructor(private readonly adminService: AdminService) {}
+
   @Get('users')
   getUsers(): Promise<User[]> {
     return this.adminService.getUsers();
   }
 
   @Delete('users/:id')
-  deleteUser(@Param('id') id: string): Promise<void> {
-    return this.adminService.deleteUser(id);
+  deleteUser(@CurrentUser() admin: AuthenticatedUser, @Param() params: UserIdParamDto): Promise<void> {
+    return this.adminService.deleteUser(params.id, admin.id);
   }
+}
 
-  @Public() // Override: no auth required
-  @Get('health')
-  health() {
+@Controller('health')
+export class HealthController {
+  @Public() // no authentication
+  @Get()
+  check(): { status: string } {
     return { status: 'ok' };
   }
 }
 ```
 
-Reference: [NestJS Guards](https://docs.nestjs.com/guards)
+Every route is authenticated unless marked `@Public()`. In the probe, a token issued while the user was `admin` read `GET /admin/users` with 200; after the database row was changed to `['member']`, the same unexpired token answered `403 {"message":"Forbidden resource",…}`, and after `isActive = false` or a `tokenVersion` bump it answered 401. Without a token the route answered 401 and `@Public()` `GET /health` 200. `RolesGuard` covers coarse roles; access to a specific resource (is this the order's owner?) is checked in the service against the stored row. `PassportModule`, `JwtStrategy` and the token payload are in `security-auth-jwt`; the throttler guard goes after these two (`security-rate-limiting`). To replace a global guard in a test, register it with `useExisting` (`nestjs-testing` rule `e2e-global-enhancers-as-providers`).
+
+Reference: [NestJS Authentication: Enable authentication globally](https://docs.nestjs.com/recipes/passport#enable-authentication-globally), [NestJS Guards](https://docs.nestjs.com/guards)
 
 ---
 
@@ -2360,81 +2298,59 @@ Reference: [NestJS Guards](https://docs.nestjs.com/guards)
 
 **Impact: HIGH** — First line of defense against attacks
 
-Always validate incoming data using class-validator decorators on DTOs and the global ValidationPipe. Never trust user input. Validate all request bodies, query parameters, and route parameters before processing.
+Validate every request body, query and route parameter with class-validator DTOs and one global `ValidationPipe`, registered as an `APP_PIPE` provider so e2e apps run it too (`nestjs-testing` rule `e2e-global-enhancers-as-providers`). Leave `enableImplicitConversion` off: it converts by the declared TypeScript type before validation, so `{ "name": 42 }` became `"42"` and passed `@IsString()` (201 in the probe). Convert query strings explicitly with `@Type(() => Number)`. `@Transform` also runs before validation, so a transform that assumes a string turns an array into a 500 (`value?.trim()` on `["a"]` did); guard each one with `typeof value === 'string'` and let the validators reject the rest.
 
-**Incorrect (trust raw input without validation):**
+**Incorrect (raw input; implicit conversion; unguarded transforms; composition rules):**
 
 ```typescript
-// Trust raw input without validation
 @Controller('users')
 export class UsersController {
   @Post()
   create(@Body() body: any) {
-    // body could contain anything - SQL injection, XSS, etc.
-    return this.usersService.create(body);
-  }
-
-  @Get()
-  findAll(@Query() query: any) {
-    // query.limit could be "'; DROP TABLE users; --"
-    return this.usersService.findAll(query.limit);
+    return this.usersService.create(body); // body could contain anything
   }
 }
 
-// DTOs without validation decorators
+// main.ts: missing from every e2e app, and converts 42 to "42" before @IsString() runs
+app.useGlobalPipes(new ValidationPipe({ transform: true, transformOptions: { enableImplicitConversion: true } }));
+
 export class CreateUserDto {
-  name: string;    // No validation
-  email: string;   // Could be "not-an-email"
-  age: number;     // Could be "abc" or -999
+  @IsString()
+  @Transform(({ value }) => value?.trim()) // ["a"] -> TypeError -> 500
+  name: string;
+
+  @MinLength(8)
+  @MaxLength(100) // rejects long passphrases
+  @Matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/) // "Passw0rd1" passes
+  password: string;
 }
 ```
 
-**Correct (validated DTOs with global ValidationPipe):**
+**Correct (global `APP_PIPE`, explicit conversion, guarded transforms):**
 
 ```typescript
-// Enable ValidationPipe globally in main.ts
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+// app.module.ts providers
+{ provide: APP_PIPE, useValue: new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }) },
+```
 
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,              // Strip unknown properties
-      forbidNonWhitelisted: true,   // Throw on unknown properties
-      transform: true,              // Auto-transform to DTO types
-      transformOptions: {
-        enableImplicitConversion: true,
-      },
-    }),
-  );
-
-  await app.listen(3000);
-}
-
-// Create well-validated DTOs
-import {
-  IsString,
-  IsEmail,
-  IsInt,
-  Min,
-  Max,
-  IsOptional,
-  MinLength,
-  MaxLength,
-  Matches,
-  IsNotEmpty,
-} from 'class-validator';
+```typescript
+// users/users.dto.ts
 import { Transform, Type } from 'class-transformer';
+import { IsEmail, IsInt, IsNotEmpty, IsOptional, IsString, IsUUID, Max, MaxLength, Min, MinLength } from 'class-validator';
+
+const trim = ({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value);
+const normalizeEmail = ({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim().toLowerCase() : value);
 
 export class CreateUserDto {
   @IsString()
   @IsNotEmpty()
   @MinLength(2)
   @MaxLength(100)
-  @Transform(({ value }) => value?.trim())
+  @Transform(trim)
   name: string;
 
   @IsEmail()
-  @Transform(({ value }) => value?.toLowerCase().trim())
+  @Transform(normalizeEmail)
   email: string;
 
   @IsInt()
@@ -2442,16 +2358,13 @@ export class CreateUserDto {
   @Max(150)
   age: number;
 
+  // Length only: no composition rules, passphrases welcome (NIST SP 800-63B-4)
   @IsString()
-  @MinLength(8)
-  @MaxLength(100)
-  @Matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/, {
-    message: 'Password must contain uppercase, lowercase, and number',
-  })
+  @MinLength(15)
+  @MaxLength(256)
   password: string;
 }
 
-// Query DTO with defaults and transformation
 export class FindUsersQueryDto {
   @IsOptional()
   @IsString()
@@ -2472,35 +2385,39 @@ export class FindUsersQueryDto {
   offset: number = 0;
 }
 
-// Param validation
 export class UserIdParamDto {
   @IsUUID('4')
   id: string;
 }
+```
 
+```typescript
 @Controller('users')
 export class UsersController {
+  constructor(private readonly usersService: UsersService) {}
+
   @Post()
   create(@Body() dto: CreateUserDto): Promise<User> {
-    // dto is guaranteed to be valid
     return this.usersService.create(dto);
   }
 
   @Get()
   findAll(@Query() query: FindUsersQueryDto): Promise<User[]> {
-    // query.limit is a number, query.search is sanitized
-    return this.usersService.findAll(query);
+    return this.usersService.findAll(query); // query.limit is a number
   }
 
   @Get(':id')
   findOne(@Param() params: UserIdParamDto): Promise<User> {
-    // params.id is a valid UUID
-    return this.usersService.findById(params.id);
+    return this.usersService.findById(params.id); // params.id is a valid UUID
   }
 }
 ```
 
-Reference: [NestJS Validation](https://docs.nestjs.com/techniques/validation)
+In the probe, `name: ["a","b"]`, `name: 42`, an unknown property, `email: ["x"]` and `password: "Passw0rd1"` each answered 400 with the violations; `"  Ann  "` and `" Ann@X.test "` were stored as `Ann` and `ann@x.test`; a 200-character passphrase was accepted; `?limit=5` arrived as the number `5` and `?limit=abc` answered 400.
+
+Passwords follow NIST SP 800-63B-4: at least 15 characters when the password is the only factor (8 with a second factor), no composition rules, long passphrases accepted. The upper bound only caps hashing work; hash with Argon2id (bcrypt ignores input past 72 bytes). The DTO can't know whether a password has leaked: in the service, reject passwords found in a breached-password list, such as the Have I Been Pwned range API, which takes only the first five hex characters of the SHA-1 hash. That outbound call is an HTTP client (`nestjs-http-client`).
+
+Reference: [NestJS Validation](https://docs.nestjs.com/techniques/validation), [NIST SP 800-63B-4: Passwords](https://pages.nist.gov/800-63-4/sp800-63b.html#password)
 
 ---
 
@@ -2512,104 +2429,108 @@ Reference: [NestJS Validation](https://docs.nestjs.com/techniques/validation)
 
 **Impact: HIGH** — Improper async handling blocks application startup
 
-NestJS lifecycle hooks (`onModuleInit`, `onApplicationBootstrap`, etc.) support async operations. However, misusing them can block application startup or cause race conditions. Understand the lifecycle order and use hooks appropriately.
+Nest awaits the promise returned from `onModuleInit`, `onApplicationBootstrap` and the shutdown hooks, so async setup belongs there, returned or awaited. A hook that starts work without awaiting it lets the app accept requests before the resource is ready and turns a setup failure into an unhandled rejection. Constructors stay synchronous and cheap: they run during dependency resolution, and blocking I/O there stalls every module. Open connections in `onModuleInit` and close them in `onApplicationShutdown`, which runs after the HTTP server has stopped; closing in `onModuleDestroy` pulls the resource from under requests that are still draining. Shutdown hooks only run on a signal when `main.ts` calls `enableShutdownHooks()` (`devops-graceful-shutdown`).
 
-**Incorrect (fire-and-forget async without await):**
+**Incorrect (fire-and-forget init; blocking constructor):**
 
 ```typescript
-// Fire-and-forget async without await
 @Injectable()
-export class DatabaseService implements OnModuleInit {
+export class RedisConnection implements OnModuleInit {
   onModuleInit() {
-    // This runs but doesn't block - app starts before DB is ready!
-    this.connect();
-  }
-
-  private async connect() {
-    await this.pool.connect();
-    console.log('Database connected');
+    this.redis.connect(); // not awaited: the app starts before Redis is ready; a failure is an unhandled rejection
   }
 }
 
-// Heavy blocking operations in constructor
 @Injectable()
-export class ConfigService {
-  private config: Config;
+export class DomainBlocklist {
+  private readonly domains: Set<string>;
 
   constructor() {
-    // BLOCKS entire module instantiation synchronously
-    this.config = fs.readFileSync('config.json');
+    this.domains = new Set(readFileSync('blocklist.txt', 'utf8').split('\n')); // blocks module instantiation
   }
 }
 ```
 
-**Correct (return promises from async hooks):**
+**Correct (`redis/redis.module.ts`):**
 
 ```typescript
-// Return promise from async hooks
-@Injectable()
-export class DatabaseService implements OnModuleInit {
-  private pool: Pool;
+import { Global, Injectable, Logger, Module, type OnApplicationShutdown, type OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Redis } from 'ioredis';
 
-  async onModuleInit(): Promise<void> {
-    // NestJS waits for this to complete before continuing
-    await this.pool.connect();
-    console.log('Database connected');
+/** Opens the shared client before the app starts and closes it after the HTTP server has stopped. */
+@Injectable()
+export class RedisConnection implements OnModuleInit, OnApplicationShutdown {
+  private readonly logger = new Logger(RedisConnection.name);
+
+  constructor(private readonly redis: Redis) {
+    // Without a listener ioredis prints "[ioredis] Unhandled error event" on every failed reconnect
+    redis.on('error', (error: Error) => this.logger.warn('Redis connection error', {}, error));
   }
 
-  async onModuleDestroy(): Promise<void> {
-    // Clean up resources on shutdown
-    await this.pool.end();
-    console.log('Database disconnected');
+  async onModuleInit(): Promise<void> {
+    await this.redis.connect(); // bootstrap waits; an unreachable Redis fails startup instead of the first request
+  }
+
+  async onApplicationShutdown(): Promise<void> {
+    await this.redis.quit(); // runs after in-flight requests have finished (devops-graceful-shutdown)
   }
 }
 
-// Use onApplicationBootstrap for cross-module dependencies
+@Global()
+@Module({
+  providers: [
+    {
+      provide: Redis,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => new Redis(config.getOrThrow<string>('REDIS_URL'), { lazyConnect: true }),
+    },
+    RedisConnection,
+  ],
+  exports: [Redis],
+})
+export class RedisModule {}
+```
+
+**Correct (`signup/domain-blocklist.ts`):**
+
+```typescript
+import { readFile } from 'node:fs/promises';
+import { Injectable, type OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+
+/** Blocked email domains, loaded once before the app accepts requests. */
 @Injectable()
-export class CacheWarmerService implements OnApplicationBootstrap {
-  constructor(
-    private cache: CacheService,
-    private products: ProductsService,
-  ) {}
+export class DomainBlocklist implements OnModuleInit {
+  private domains = new Set<string>();
+
+  constructor(private readonly config: ConfigService) {} // keep the constructor synchronous and cheap
+
+  async onModuleInit(): Promise<void> {
+    // Awaited by app.init(): a missing file fails startup instead of the first signup
+    const text = await readFile(this.config.getOrThrow<string>('BLOCKLIST_PATH'), 'utf8');
+    this.domains = new Set(text.split('\n').map((line) => line.trim().toLowerCase()).filter(Boolean));
+  }
+
+  isBlocked(email: string): boolean {
+    return this.domains.has(email.slice(email.lastIndexOf('@') + 1).toLowerCase());
+  }
+}
+```
+
+```typescript
+// Runs after every module's onModuleInit: safe to use other modules' providers
+@Injectable()
+export class PopularProductsWarmer implements OnApplicationBootstrap {
+  constructor(private readonly products: ProductsService) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    // All modules are initialized, safe to warm cache
-    const products = await this.products.findPopular();
-    await this.cache.warmup(products);
+    await this.products.getPopular(); // fills the cache (perf-use-caching)
   }
-}
-
-// Heavy init in async hooks, not constructor
-@Injectable()
-export class ConfigService implements OnModuleInit {
-  private config: Config;
-
-  constructor() {
-    // Keep constructor synchronous and fast
-  }
-
-  async onModuleInit(): Promise<void> {
-    // Async loading in lifecycle hook
-    this.config = await this.loadConfig();
-  }
-
-  private async loadConfig(): Promise<Config> {
-    const file = await fs.promises.readFile('config.json');
-    return JSON.parse(file.toString());
-  }
-
-  get<T>(key: string): T {
-    return this.config[key];
-  }
-}
-
-// Enable shutdown hooks in main.ts
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  app.enableShutdownHooks(); // Enable SIGTERM/SIGINT handling
-  await app.listen(3000);
 }
 ```
+
+In the probe (`ioredis` 6.0.0 against a local RESP stub), `app.init()` resolved with the blocklist loaded and the client connected, and `app.close()` sent `QUIT`. A missing `BLOCKLIST_PATH` file rejected `init()` with `ENOENT: no such file or directory`; an unreachable Redis rejected it with `Connection is closed.` after logging `warn('Redis connection error', {}, Error('connect ECONNREFUSED 127.0.0.1:1'))`. Configuration comes from the validated `ConfigService` (`devops-use-config-module`). Providers of lazily loaded modules get no lifecycle hooks (`perf-lazy-loading`).
 
 Reference: [NestJS Lifecycle Events](https://docs.nestjs.com/fundamentals/lifecycle-events)
 
@@ -2619,116 +2540,67 @@ Reference: [NestJS Lifecycle Events](https://docs.nestjs.com/fundamentals/lifecy
 
 **Impact: MEDIUM** — Improves startup time for large applications
 
-NestJS supports lazy-loading modules, which defers initialization until first use. This is valuable for large applications where some features are rarely used, serverless deployments where cold start time matters, or when certain modules have heavy initialization costs.
+`LazyModuleLoader` defers a module's import and instantiation until first use. It pays off for rarely used features with heavy dependencies and for serverless cold starts; in a long-running server the work only moves from startup to the first request. Three things go wrong in practice: the dynamic import needs the `.js` suffix like every relative ESM import (`nestjs-setup` rule `esm-imports-and-paths`), concurrent first calls each load the module unless the *promise* is cached, and lifecycle hooks (`onModuleInit`, `onApplicationBootstrap`, shutdown hooks) are not called for providers of a lazily loaded module, so a provider that needs async setup or teardown does not belong there.
 
-**Incorrect (loading everything eagerly):**
+**Incorrect (extensionless import; result cached after the await):**
 
 ```typescript
-// Load everything eagerly in a large app
-@Module({
-  imports: [
-    UsersModule,
-    OrdersModule,
-    PaymentsModule,
-    ReportsModule, // Heavy, rarely used
-    AnalyticsModule, // Heavy, rarely used
-    AdminModule, // Only admins use this
-    LegacyModule, // Migration module, rarely used
-    BulkImportModule, // Used once a month
-  ],
-})
-export class AppModule {}
+private adminModule: ModuleRef | null = null;
 
-// All modules initialize at startup, even if never used
-// Slow cold starts in serverless
-// Memory wasted on unused modules
+private async getAdminModule(): Promise<ModuleRef> {
+  if (!this.adminModule) {
+    const { AdminModule } = await import('./admin/admin.module'); // TS2307: Cannot find module './admin/admin.module'
+    this.adminModule = await this.lazyModuleLoader.load(() => AdminModule); // concurrent callers all get here
+  }
+  return this.adminModule;
+}
 ```
 
-**Correct (lazy load rarely-used modules):**
+**Correct (`reports/reports.facade.ts`):**
 
 ```typescript
-// Use LazyModuleLoader for optional modules
-import { LazyModuleLoader } from '@nestjs/core';
+import { Injectable, Logger, type OnApplicationBootstrap } from '@nestjs/common';
+import { LazyModuleLoader, type ModuleRef } from '@nestjs/core';
 
+/** Loads ReportsModule on first use; every caller shares one load. */
 @Injectable()
-export class ReportsService {
-  constructor(private lazyModuleLoader: LazyModuleLoader) {}
+export class ReportsFacade implements OnApplicationBootstrap {
+  private readonly logger = new Logger(ReportsFacade.name);
+  private reportsModule?: Promise<ModuleRef>;
 
-  async generateReport(type: string): Promise<Report> {
-    // Load module only when needed
-    const { ReportsModule } = await import('./reports/reports.module');
-    const moduleRef = await this.lazyModuleLoader.load(() => ReportsModule);
+  constructor(private readonly lazyModuleLoader: LazyModuleLoader) {}
 
-    const reportsService = moduleRef.get(ReportsGeneratorService);
-    return reportsService.generate(type);
-  }
-}
-
-// Lazy load admin features with caching
-@Injectable()
-export class AdminService {
-  private adminModule: ModuleRef | null = null;
-
-  constructor(private lazyModuleLoader: LazyModuleLoader) {}
-
-  private async getAdminModule(): Promise<ModuleRef> {
-    if (!this.adminModule) {
-      const { AdminModule } = await import('./admin/admin.module');
-      this.adminModule = await this.lazyModuleLoader.load(() => AdminModule);
-    }
-    return this.adminModule;
+  async generate(type: string): Promise<string> {
+    const moduleRef = await this.module();
+    const { ReportGenerator } = await import('./reports/reports.module.js');
+    return moduleRef.get(ReportGenerator).generate(type);
   }
 
-  async runAdminTask(task: string): Promise<void> {
-    const moduleRef = await this.getAdminModule();
-    const taskRunner = moduleRef.get(AdminTaskRunner);
-    await taskRunner.run(task);
-  }
-}
-
-// Reusable lazy loader service
-@Injectable()
-export class ModuleLoaderService {
-  private loadedModules = new Map<string, ModuleRef>();
-
-  constructor(private lazyModuleLoader: LazyModuleLoader) {}
-
-  async load<T>(
-    key: string,
-    importFn: () => Promise<{ default: Type<T> } | Type<T>>,
-  ): Promise<ModuleRef> {
-    if (!this.loadedModules.has(key)) {
-      const module = await importFn();
-      const moduleType = 'default' in module ? module.default : module;
-      const moduleRef = await this.lazyModuleLoader.load(() => moduleType);
-      this.loadedModules.set(key, moduleRef);
-    }
-    return this.loadedModules.get(key)!;
-  }
-}
-
-// Preload modules in background after startup
-@Injectable()
-export class ModulePreloader implements OnApplicationBootstrap {
-  constructor(private lazyModuleLoader: LazyModuleLoader) {}
-
-  async onApplicationBootstrap(): Promise<void> {
-    setTimeout(async () => {
-      await this.preloadModule(() => import('./reports/reports.module'));
-    }, 5000); // 5 seconds after startup
+  /** Optional warm-up after startup; a failure leaves the module to load on first use. */
+  onApplicationBootstrap(): void {
+    this.module().catch((error: unknown) => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.logger.warn('Reports module preload failed', {}, err);
+    });
   }
 
-  private async preloadModule(importFn: () => Promise<any>): Promise<void> {
-    try {
-      const module = await importFn();
-      const moduleType = module.default || Object.values(module)[0];
-      await this.lazyModuleLoader.load(() => moduleType);
-    } catch (error) {
-      console.warn('Failed to preload module', error);
-    }
+  private module(): Promise<ModuleRef> {
+    // Cache the promise, not the result: concurrent first calls share one load
+    this.reportsModule ??= this.load().catch((error: unknown) => {
+      this.reportsModule = undefined; // a failed load is retried on the next call
+      throw error;
+    });
+    return this.reportsModule;
+  }
+
+  private async load(): Promise<ModuleRef> {
+    const { ReportsModule } = await import('./reports/reports.module.js');
+    return this.lazyModuleLoader.load(() => ReportsModule);
   }
 }
 ```
+
+`ReportsModule` is not in any `imports` array; only the facade is registered eagerly. In the probe, three concurrent first calls through the incorrect getter constructed `ReportGenerator` three times (they then received one `ModuleRef`); through the facade, three concurrent `generate()` calls constructed it once. The class is taken from the same typed `import()`, so no `Object.values(module)[0]` or `Promise<any>` is needed.
 
 Reference: [NestJS Lazy Loading Modules](https://docs.nestjs.com/fundamentals/lazy-loading-modules)
 
@@ -2738,128 +2610,73 @@ Reference: [NestJS Lazy Loading Modules](https://docs.nestjs.com/fundamentals/la
 
 **Impact: HIGH** — Database queries are typically the largest source of latency
 
-Select only needed columns, use proper indexes, avoid over-fetching relations, and consider query performance when designing your data access. Most API slowness traces back to inefficient database queries.
+Fetch only the columns and relations a response needs, bound every list with a page size and a deterministic order, and add indexes for the queries you actually run, confirmed with the database's query plan. Each index costs a write on every insert and update, so an index nobody's query uses is pure cost. Loading relations without N+1 is `db-avoid-n-plus-one`; TypeORM 1.x query syntax is `nestjs-typeorm` (`orm-v1-removed-apis`), and indexes ship in migrations (`nestjs-typeorm` `migration-list-classes`).
 
-**Incorrect (over-fetching data and missing indexes):**
-
-```typescript
-// Select everything when you need few fields
-@Injectable()
-export class UsersService {
-  async findAllEmails(): Promise<string[]> {
-    const users = await this.repo.find();
-    // Fetches ALL columns for ALL users
-    return users.map((u) => u.email);
-  }
-
-  async getUserSummary(id: string): Promise<UserSummary> {
-    const user = await this.repo.findOne({
-      where: { id },
-      relations: ['posts', 'posts.comments', 'posts.comments.author', 'followers'],
-    });
-    // Over-fetches massive relation tree
-    return { name: user.name, postCount: user.posts.length };
-  }
-}
-
-// No indexes on frequently queried columns
-@Entity()
-export class Order {
-  @Column()
-  userId: string; // No index - full table scan on every lookup
-
-  @Column()
-  status: string; // No index - slow status filtering
-}
-```
-
-**Correct (select only needed data with proper indexes):**
+**Incorrect (over-fetching; speculative indexes; unbounded, unordered lists):**
 
 ```typescript
-// Select only needed columns
-@Injectable()
-export class UsersService {
-  async findAllEmails(): Promise<string[]> {
-    const users = await this.repo.find({
-      select: ['email'], // Only fetch email column
-    });
-    return users.map((u) => u.email);
-  }
-
-  // Use QueryBuilder for complex selections
-  async getUserSummary(id: string): Promise<UserSummary> {
-    return this.repo
-      .createQueryBuilder('user')
-      .select('user.name', 'name')
-      .addSelect('COUNT(post.id)', 'postCount')
-      .leftJoin('user.posts', 'post')
-      .where('user.id = :id', { id })
-      .groupBy('user.id')
-      .getRawOne();
-  }
-
-  // Fetch relations only when needed
-  async getFullProfile(id: string): Promise<User> {
-    return this.repo.findOne({
-      where: { id },
-      relations: ['posts'], // Only immediate relation
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        posts: {
-          id: true,
-          title: true,
-        },
-      },
-    });
-  }
+async findAllEmails(): Promise<string[]> {
+  const users = await this.users.find(); // every column of every user
+  return users.map((u) => u.email);
 }
 
-// Add indexes on frequently queried columns
-@Entity()
+@Entity('orders')
 @Index(['userId'])
 @Index(['status'])
 @Index(['createdAt'])
-@Index(['userId', 'status']) // Composite index for common query pattern
-export class Order {
-  @PrimaryGeneratedColumn('uuid')
-  id: string;
+@Index(['userId', 'status']) // the single-column userId index duplicates this one's prefix
+export class Order { /* ... */ }
 
-  @Column()
-  userId: string;
-
-  @Column()
-  status: string;
-
-  @CreateDateColumn()
-  createdAt: Date;
-}
-
-// Always paginate large datasets
-@Injectable()
-export class OrdersService {
-  async findAll(page = 1, limit = 20): Promise<PaginatedResult<Order>> {
-    const [items, total] = await this.repo.findAndCount({
-      skip: (page - 1) * limit,
-      take: limit,
-      order: { createdAt: 'DESC' },
-    });
-
-    return {
-      items,
-      meta: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-      },
-    };
-  }
+findAll(): Promise<Order[]> {
+  return this.orders.find(); // no limit; row order undefined
 }
 ```
 
-Reference: [TypeORM Query Builder](https://typeorm.io/select-query-builder)
+**Correct (narrow selects, one index per real query, stable pages):**
+
+```typescript
+async findAllEmails(): Promise<string[]> {
+  const users = await this.users.find({ select: { email: true } });
+  return users.map((u) => u.email);
+}
+
+getProfile(id: string): Promise<User | null> {
+  return this.users.findOne({
+    where: { id },
+    relations: { posts: true },
+    select: { id: true, name: true, email: true, posts: { id: true, title: true } },
+  });
+}
+```
+
+```typescript
+// Serves "a user's orders in one status, newest first": equality columns first, then the sort columns
+@Entity('orders')
+@Index('IDX_orders_user_status_created', ['userId', 'status', 'createdAt', 'id'])
+export class Order {
+  @PrimaryGeneratedColumn('uuid') id: string;
+  @Column() userId: string;
+  @Column() status: string;
+  @Column('integer') total: number;
+  @CreateDateColumn() createdAt: Date;
+  @OneToMany(() => OrderItem, (item) => item.order) items: Relation<OrderItem[]>;
+}
+```
+
+```typescript
+findPage(userId: string, status: string, page: number, limit: number): Promise<[Order[], number]> {
+  return this.orders.findAndCount({
+    where: { userId, status },
+    order: { createdAt: 'DESC', id: 'DESC' }, // id breaks ties: a deterministic order, so equal timestamps don't swap between pages
+    skip: (page - 1) * limit,
+    take: limit, // validate limit with an upper bound (@Max(100)) in the query DTO
+  });
+}
+```
+
+Check the plan for the query the index is for. On better-sqlite3, `EXPLAIN QUERY PLAN SELECT * FROM orders WHERE userId = ? AND status = ? ORDER BY createdAt DESC, id DESC LIMIT 2` returned `SEARCH orders USING INDEX IDX_orders_user_status_created (userId=? AND status=?)`. With the index on `(userId, status, createdAt)` only, it added `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`: the tie-break column has to be in the index too, or every page sorts in memory. The same index serves `WHERE userId = ?` alone (`SEARCH … (userId=?)`, a prefix), so a separate `userId` index adds write cost and nothing else; `WHERE status = ?` alone is `SCAN orders`. Add an index for that access path only when that query exists. Offset pages get slower as `skip` grows, and a row inserted or deleted between requests shifts every later page, so the next page repeats or skips a row. For deep or live lists, page by cursor (`WHERE userId = ? AND status = ? AND (createdAt, id) < (?, ?)`, planned as `SEARCH … (userId=? AND status=? AND (createdAt,id)<(?,?))`) on the same index: each page starts after the last row the client saw, so pages neither overlap nor skip existing rows.
+
+Reference: [SQLite EXPLAIN QUERY PLAN](https://www.sqlite.org/eqp.html)
 
 ---
 
@@ -2867,123 +2684,154 @@ Reference: [TypeORM Query Builder](https://typeorm.io/select-query-builder)
 
 **Impact: HIGH** — Dramatically reduces database load and response times
 
-Implement caching for expensive operations, frequently accessed data, and external API calls. Use NestJS CacheModule with appropriate TTLs and cache invalidation strategies. Don't cache everything - focus on high-impact areas.
+Cache expensive reads that many requests share, with a TTL that matches how stale the data may be, and make sure no entry read before a write commits is served after it. The cache key must contain everything the response depends on. `CacheInterceptor` keys on the request URL (`httpAdapter.getRequestUrl`), path parameters and query string included, and caches `GET` only. A static `@CacheKey('category')` replaces that key for every request to the route: in the probe, `GET /categories/1` then `GET /categories/2` both returned `{"id":"1"}`. A response that depends on the caller (`/me`, anything behind a guard that filters by user or tenant) must not use a URL-only key, or the first caller's data is served to everyone.
 
-**Incorrect (no caching or caching everything):**
+**Incorrect (static key on a parameterized route; personalized response under a shared key):**
 
 ```typescript
-// No caching for expensive, repeated queries
-@Injectable()
-export class ProductsService {
-  async getPopular(): Promise<Product[]> {
-    // Runs complex aggregation query EVERY request
-    return this.productsRepo
-      .createQueryBuilder('p')
-      .leftJoin('p.orders', 'o')
-      .select('p.*, COUNT(o.id) as orderCount')
-      .groupBy('p.id')
-      .orderBy('orderCount', 'DESC')
-      .limit(20)
-      .getMany();
+@Controller('categories')
+@UseInterceptors(CacheInterceptor)
+export class CategoriesController {
+  @Get(':id')
+  @CacheKey('category') // every id shares one entry
+  findOne(@Param('id') id: string): Promise<Category> {
+    return this.categories.findOne(id);
   }
 }
 
-// Cache everything without thought
-@Injectable()
-export class UsersService {
-  @CacheKey('users')
-  @CacheTTL(3600)
-  @UseInterceptors(CacheInterceptor)
-  async findAll(): Promise<User[]> {
-    // Caching user list for 1 hour is wrong if data changes frequently
-    return this.usersRepo.find();
-  }
+@Get('me/feed')
+@UseInterceptors(CacheInterceptor) // key is "/me/feed": user B gets user A's feed
+feed(@CurrentUser() user: User): Promise<FeedItem[]> {
+  return this.feeds.forUser(user.id);
+}
+
+async getPopular(): Promise<Product[]> {
+  const cached = await this.cache.get<Product[]>('products:popular');
+  if (cached) return cached; // a cached 0, '' or false is treated as a miss
+  // ...
+}
+
+async update(id: string, dto: UpdateProductDto): Promise<void> {
+  await this.transactions.run((manager) => manager.update(Product, { id }, dto));
+  await this.cache.del('products:popular'); // a reader that queried before the commit sets the old list again
 }
 ```
 
-**Correct (strategic caching with proper invalidation):**
+**Correct (store, URL keys, per-principal keys, generation keys):**
 
 ```typescript
-// Setup caching module
+// cache/redis-cache.module.ts — shared store; omit `stores` for the in-memory default
+import KeyvRedis from '@keyv/redis';
+import { CacheModule } from '@nestjs/cache-manager';
+import { Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+
 @Module({
   imports: [
     CacheModule.registerAsync({
-      imports: [ConfigModule],
+      isGlobal: true,
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        stores: [
-          new KeyvRedis(config.get('REDIS_URL')),
-        ],
-        ttl: 60 * 1000, // Default 60s
+        stores: [new KeyvRedis(config.getOrThrow<string>('REDIS_URL'))],
+        ttl: 60_000, // default 60 s, in milliseconds
       }),
     }),
   ],
 })
-export class AppModule {}
+export class RedisCacheModule {}
+```
 
-// Manual caching for granular control
-@Injectable()
-export class ProductsService {
-  constructor(
-    @Inject(CACHE_MANAGER) private cache: Cache,
-    private productsRepo: ProductRepository,
-  ) {}
-
-  async getPopular(): Promise<Product[]> {
-    const cacheKey = 'products:popular';
-
-    // Try cache first
-    const cached = await this.cache.get<Product[]>(cacheKey);
-    if (cached) return cached;
-
-    // Cache miss - fetch and cache
-    const products = await this.fetchPopularProducts();
-    await this.cache.set(cacheKey, products, 5 * 60 * 1000); // 5 min TTL
-    return products;
-  }
-
-  // Invalidate cache on changes
-  async updateProduct(id: string, dto: UpdateProductDto): Promise<Product> {
-    const product = await this.productsRepo.save({ id, ...dto });
-    await this.cache.del('products:popular'); // Invalidate
-    return product;
-  }
-}
-
-// Decorator-based caching with auto-interceptor
+```typescript
+// The URL is the key: /categories/1 and /categories/2 are separate entries
 @Controller('categories')
 @UseInterceptors(CacheInterceptor)
 export class CategoriesController {
-  @Get()
-  @CacheTTL(30 * 60 * 1000) // 30 minutes - categories rarely change
-  findAll(): Promise<Category[]> {
-    return this.categoriesService.findAll();
-  }
-
   @Get(':id')
-  @CacheTTL(60 * 1000) // 1 minute
-  @CacheKey('category')
-  findOne(@Param('id') id: string): Promise<Category> {
-    return this.categoriesService.findOne(id);
-  }
-}
-
-// Event-based cache invalidation
-@Injectable()
-export class CacheInvalidationService {
-  constructor(@Inject(CACHE_MANAGER) private cache: Cache) {}
-
-  @OnEvent('product.created')
-  @OnEvent('product.updated')
-  @OnEvent('product.deleted')
-  async invalidateProductCaches(event: ProductEvent) {
-    await Promise.all([
-      this.cache.del('products:popular'),
-      this.cache.del(`product:${event.productId}`),
-    ]);
+  @CacheTTL(60_000)
+  findOne(@Param('id', ParseUUIDPipe) id: string): Promise<CategoryDto> {
+    return this.categories.findOne(id);
   }
 }
 ```
+
+```typescript
+// cache/user-cache.interceptor.ts
+import { CacheInterceptor } from '@nestjs/cache-manager';
+import { Injectable, type ExecutionContext } from '@nestjs/common';
+import type { Request } from 'express';
+
+interface AuthenticatedRequest extends Request {
+  user?: { id: string };
+}
+
+/** Per-principal cache key for responses that depend on who asks; uncached without a key or a user. */
+@Injectable()
+export class UserCacheInterceptor extends CacheInterceptor {
+  protected override async trackBy(context: ExecutionContext): Promise<string | undefined> {
+    const key = await super.trackBy(context); // a @CacheKey() factory may return a promise
+    const user = context.switchToHttp().getRequest<AuthenticatedRequest>().user;
+    return key && user ? `user:${user.id}:${key}` : undefined;
+  }
+}
+
+// usage: @Get('me/feed') @UseInterceptors(UserCacheInterceptor) @CacheTTL(30_000)
+```
+
+```typescript
+// cache/cache-generation.ts: one row per cached data set, created by a migration (nestjs-typeorm)
+@Entity('cache_generations')
+export class CacheGeneration {
+  @PrimaryColumn() name: string;
+  @Column('integer') value: number;
+}
+
+export async function readGeneration(manager: EntityManager, name: string): Promise<number> {
+  return (await manager.findOneBy(CacheGeneration, { name }))?.value ?? 0;
+}
+
+export async function bumpGeneration(manager: EntityManager, name: string): Promise<void> {
+  await manager.createQueryBuilder().insert().into(CacheGeneration).values({ name, value: 0 }).orIgnore().execute();
+  await manager.increment(CacheGeneration, { name }, 'value', 1);
+}
+```
+
+```typescript
+// products/products.service.ts
+const POPULAR = 'products:popular';
+
+@Injectable()
+export class ProductsService {
+  constructor(
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly transactions: TransactionRunner,
+  ) {}
+
+  async getPopular(): Promise<Product[]> {
+    const generation = await this.transactions.run((manager) => readGeneration(manager, POPULAR));
+    const cached = await this.cache.get<Product[]>(`${POPULAR}:${generation}`);
+    if (cached !== undefined) return cached; // an empty list is a valid cached value
+
+    // The list and the generation it belongs to, read in one transaction
+    const fresh = await this.transactions.run(async (manager) => ({
+      generation: await readGeneration(manager, POPULAR),
+      products: await manager.find(Product, { order: { orderCount: 'DESC' }, take: 20 }),
+    }));
+    await this.cache.set(`${POPULAR}:${fresh.generation}`, fresh.products, 5 * 60_000);
+    return fresh.products;
+  }
+
+  update(id: string, dto: UpdateProductDto): Promise<void> {
+    return this.transactions.run(async (manager) => {
+      await manager.update(Product, { id }, dto);
+      await bumpGeneration(manager, POPULAR); // commits with the change, or not at all
+    });
+  }
+}
+```
+
+Probe results (in-memory store, `@nestjs/cache-manager` 12.0.2, `cache-manager` 7.2.9): `/categories/1`, `/categories/2`, `/categories/1` returned `n` 1, 2, 1, so the second id ran the handler and the third request was a hit. `/me/feed` for `u1`, `u2`, `u1` returned 1, 2, 1, and two anonymous requests returned 3 and 4 (not cached). On a route with an async `@CacheKey()` factory keyed on `?tab=`, a synchronous `trackBy` override (`${super.trackBy(context)}` in a template string, so the key holds `[object Promise]`) answered `tab=b` with the cached `tab=a` body; the awaiting override cached them separately. A reader held between its query and its `cache.set()` while `update()` committed: with delete-after-commit the next two reads returned the old name, with the database generation the new one. When the cache rejected writes right after the commit, a generation kept in the cache left `update()` rejected (`ECONNRESET`) after the row had changed, and the next reads returned `old`; the database generation made no cache call in `update()`, and the next reads returned `new`. On an empty table, three `getPopular()` calls returned `[]` with one list query. Through `RedisCacheModule` (`@keyv/redis` 6.1.0, Redis 8.10.2) a cached `[]` came back as `[]` and a miss as `undefined`; `CacheInterceptor` itself treats a cached `null` as a miss.
+
+Writes go through `TransactionRunner` (`nestjs-typeorm` rule `orm-atomic-writes`). Deleting a key after the commit is not enough: a reader that queried before the commit can `set()` the old value after the `del()`. Changing a generation kept in the cache is a second write after the commit that can fail on its own. The generation therefore lives in the database and changes in the same transaction as the data; a reader caches a list only under the generation it read in that same transaction, so a late `set()` lands on a key nobody reads. That costs one primary-key read through `run()` per request, queued behind open transactions like every committed read. Entries under old generations expire with their TTL. Don't cache what changes on most requests, and don't cache errors.
 
 Reference: [NestJS Caching](https://docs.nestjs.com/techniques/caching)
 
@@ -2997,377 +2845,62 @@ Reference: [NestJS Caching](https://docs.nestjs.com/techniques/caching)
 
 **Impact: HIGH** — N+1 queries are one of the most common performance killers
 
-N+1 queries occur when you fetch a list of entities, then make an additional query for each entity to load related data. Use eager loading with `relations`, query builder joins, or DataLoader to batch queries efficiently.
+N+1 queries happen when you load a list, then issue one more query per row for its related data. Load the relations with the list (`relations`, or a query-builder join), aggregate in SQL when you only need counts, and batch per request (DataLoader over one `In(ids)` query) when resolvers fetch relations field by field. TypeORM 1.x query syntax (object `relations`/`select`, no string arrays) is owned by `nestjs-typeorm` rule `orm-v1-removed-apis`; entities type relations as `Relation<T>` (`orm-relation-wrapper`).
 
-**Incorrect (lazy loading in loops causes N+1):**
+**Incorrect (one query per order):**
 
 ```typescript
-// Lazy loading in loops causes N+1
-@Injectable()
-export class OrdersService {
-  async getOrdersWithItems(userId: string): Promise<Order[]> {
-    const orders = await this.orderRepo.find({ where: { userId } });
-    // 1 query for orders
-
-    for (const order of orders) {
-      // N additional queries - one per order!
-      order.items = await this.itemRepo.find({ where: { orderId: order.id } });
-    }
-
-    return orders;
+async getOrdersWithItems(userId: string): Promise<Order[]> {
+  const orders = await this.orders.find({ where: { userId } }); // 1 query
+  for (const order of orders) {
+    order.items = await this.items.find({ where: { order: { id: order.id } } }); // + 1 per order
   }
-}
-
-// Accessing lazy relations without loading
-@Controller('users')
-export class UsersController {
-  @Get()
-  async findAll(): Promise<User[]> {
-    const users = await this.userRepo.find();
-    // If User.posts is lazy-loaded, serializing triggers N queries
-    return users; // Each user.posts access = 1 query
-  }
+  return orders;
 }
 ```
 
-**Correct (use relations for eager loading):**
+**Correct (relations loaded with the list; counts aggregated in SQL):**
 
 ```typescript
-// Use relations option for eager loading
-@Injectable()
-export class OrdersService {
-  async getOrdersWithItems(userId: string): Promise<Order[]> {
-    // Single query with JOIN
-    return this.orderRepo.find({
-      where: { userId },
-      relations: ['items', 'items.product'],
-    });
-  }
-}
-
-// Use QueryBuilder for complex joins
-@Injectable()
-export class UsersService {
-  async getUsersWithPostCounts(): Promise<UserWithPostCount[]> {
-    return this.userRepo
-      .createQueryBuilder('user')
-      .leftJoin('user.posts', 'post')
-      .select('user.id', 'id')
-      .addSelect('user.name', 'name')
-      .addSelect('COUNT(post.id)', 'postCount')
-      .groupBy('user.id')
-      .getRawMany();
-  }
-
-  async getActiveUsersWithPosts(): Promise<User[]> {
-    return this.userRepo
-      .createQueryBuilder('user')
-      .leftJoinAndSelect('user.posts', 'post')
-      .leftJoinAndSelect('post.comments', 'comment')
-      .where('user.isActive = :active', { active: true })
-      .andWhere('post.status = :status', { status: 'published' })
-      .getMany();
-  }
-}
-
-// Use find options for specific fields
-async getOrderSummaries(userId: string): Promise<OrderSummary[]> {
-  return this.orderRepo.find({
+getOrdersWithItems(userId: string): Promise<Order[]> {
+  return this.orders.find({
     where: { userId },
-    relations: ['items'],
-    select: {
-      id: true,
-      total: true,
-      status: true,
-      items: {
-        id: true,
-        quantity: true,
-        price: true,
-      },
-    },
+    relations: { items: { product: true } },
   });
 }
 
-// Use DataLoader for GraphQL to batch and cache queries
-import DataLoader from 'dataloader';
+getUsersWithPostCounts(): Promise<{ id: string; name: string; postCount: number }[]> {
+  return this.users
+    .createQueryBuilder('user')
+    .leftJoin('user.posts', 'post')
+    .select('user.id', 'id')
+    .addSelect('user.name', 'name')
+    .addSelect('COUNT(post.id)', 'postCount')
+    .groupBy('user.id')
+    .getRawMany();
+}
 
-@Injectable({ scope: Scope.REQUEST })
-export class PostsLoader {
-  constructor(private postsService: PostsService) {}
+getActiveUsersWithPublishedPosts(): Promise<User[]> {
+  return this.users
+    .createQueryBuilder('user')
+    // the condition belongs to the join: users without published posts stay in the result
+    .leftJoinAndSelect('user.posts', 'post', 'post.status = :status', { status: 'published' })
+    .where('user.isActive = :active', { active: true })
+    .getMany();
+}
 
-  readonly batchPosts = new DataLoader<string, Post[]>(async (userIds) => {
-    // Single query for all users' posts
-    const posts = await this.postsService.findByUserIds([...userIds]);
-
-    // Group by userId
-    const postsMap = new Map<string, Post[]>();
-    for (const post of posts) {
-      const userPosts = postsMap.get(post.userId) || [];
-      userPosts.push(post);
-      postsMap.set(post.userId, userPosts);
-    }
-
-    // Return in same order as input
-    return userIds.map((id) => postsMap.get(id) || []);
+getOrderSummaries(userId: string): Promise<Order[]> {
+  return this.orders.find({
+    where: { userId },
+    relations: { items: true },
+    select: { id: true, total: true, status: true, items: { id: true, quantity: true, price: true } },
   });
 }
-
-// In resolver
-@ResolveField()
-async posts(@Parent() user: User): Promise<Post[]> {
-  // DataLoader batches multiple calls into single query
-  return this.postsLoader.batchPosts.load(user.id);
-}
-
-// Enable query logging in development to detect N+1
-TypeOrmModule.forRoot({
-  logging: ['query', 'error'],
-  logger: 'advanced-console',
-});
 ```
 
-Reference: [TypeORM Relations](https://typeorm.io/relations)
+With five orders of one item each, the loop issued 6 `SELECT`s and `relations: { items: { product: true } }` issued 1, with every `items[].product` populated. `getOrderSummaries` returned `{"id":…,"status":"open","total":0,"items":[{"id":…,"quantity":1,"price":2}]}`, nothing else. To spot N+1 in development, turn on `logging: ['query']` in the one `dataSourceOptions` (`nestjs-typeorm` rule `orm-single-data-source`), not in a second `TypeOrmModule.forRoot`.
 
----
-
-### 6.2 Use Database Migrations
-
-**Impact: HIGH** — Enables safe, repeatable database schema changes
-
-Use migrations for every schema change, in every environment, including tests: keep `synchronize: false` everywhere so the schema your tests run against is the one your migrations produce. Migrations provide version control for your database, enable safe rollbacks, and ensure consistency across all environments. The wiring (one `data-source.ts` shared by the CLI and Nest, migration classes listed explicitly, the CLI runner for ESM projects) is in the `nestjs-typeorm` skill; this rule covers what a migration should contain.
-
-**Incorrect (using synchronize or manual SQL):**
-
-```typescript
-// Use synchronize in production
-TypeOrmModule.forRoot({
-  type: 'postgres',
-  synchronize: true, // DANGEROUS in production!
-  // Can drop columns, tables, or data
-});
-
-// Manual SQL in production
-@Injectable()
-export class DatabaseService {
-  async addColumn(): Promise<void> {
-    await this.dataSource.query('ALTER TABLE users ADD COLUMN age INT');
-    // No version control, no rollback, inconsistent across envs
-  }
-}
-
-// Modify entities without migration
-@Entity()
-export class User {
-  @Column()
-  email: string;
-
-  @Column() // Added without migration
-  newField: string; // Will crash in production if synchronize is false
-}
-```
-
-**Correct (use migrations for all schema changes):**
-
-```typescript
-// Wiring: see nestjs-typeorm (data-source.ts, CLI, migrations listed as classes).
-// Always: synchronize: false, migrationsRun: true.
-
-// migrations/1705312800000-AddUserAge.ts
-import { MigrationInterface, QueryRunner } from 'typeorm';
-
-export class AddUserAge1705312800000 implements MigrationInterface {
-  name = 'AddUserAge1705312800000';
-
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    // Add column with default to handle existing rows
-    await queryRunner.query(`
-      ALTER TABLE "users" ADD "age" integer DEFAULT 0
-    `);
-
-    // Add index for frequently queried columns
-    await queryRunner.query(`
-      CREATE INDEX "IDX_users_age" ON "users" ("age")
-    `);
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    // Always implement down for rollback
-    await queryRunner.query(`DROP INDEX "IDX_users_age"`);
-    await queryRunner.query(`ALTER TABLE "users" DROP COLUMN "age"`);
-  }
-}
-
-// Safe column rename (two-step)
-export class RenameNameToFullName1705312900000 implements MigrationInterface {
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    // Step 1: Add new column
-    await queryRunner.query(`
-      ALTER TABLE "users" ADD "full_name" varchar(255)
-    `);
-
-    // Step 2: Copy data
-    await queryRunner.query(`
-      UPDATE "users" SET "full_name" = "name"
-    `);
-
-    // Step 3: Add NOT NULL constraint
-    await queryRunner.query(`
-      ALTER TABLE "users" ALTER COLUMN "full_name" SET NOT NULL
-    `);
-
-    // Step 4: Drop old column (after verifying app works)
-    await queryRunner.query(`
-      ALTER TABLE "users" DROP COLUMN "name"
-    `);
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.query(`ALTER TABLE "users" ADD "name" varchar(255)`);
-    await queryRunner.query(`UPDATE "users" SET "name" = "full_name"`);
-    await queryRunner.query(`ALTER TABLE "users" DROP COLUMN "full_name"`);
-  }
-}
-```
-
-Reference: [TypeORM Migrations](https://typeorm.io/docs/advanced-topics/migrations/)
-
----
-
-### 6.3 Use Transactions for Multi-Step Operations
-
-**Impact: HIGH** — Ensures data consistency in multi-step operations
-
-When multiple database operations must succeed or fail together, wrap them in a transaction. This prevents partial updates that leave your data in an inconsistent state. Use TypeORM's transaction APIs or the DataSource query runner for complex scenarios.
-
-**Incorrect (multiple saves without transaction):**
-
-```typescript
-// Multiple saves without transaction
-@Injectable()
-export class OrdersService {
-  async createOrder(userId: string, items: OrderItem[]): Promise<Order> {
-    // If any step fails, data is inconsistent
-    const order = await this.orderRepo.save({ userId, status: 'pending' });
-
-    for (const item of items) {
-      await this.orderItemRepo.save({ orderId: order.id, ...item });
-      await this.inventoryRepo.decrement({ productId: item.productId }, 'stock', item.quantity);
-    }
-
-    await this.paymentService.charge(order.id);
-    // If payment fails, order and inventory are already modified!
-
-    return order;
-  }
-}
-```
-
-**Correct (use DataSource.transaction for automatic rollback):**
-
-```typescript
-// Use DataSource.transaction() for automatic rollback
-@Injectable()
-export class OrdersService {
-  constructor(private dataSource: DataSource) {}
-
-  async createOrder(userId: string, items: OrderItem[]): Promise<Order> {
-    return this.dataSource.transaction(async (manager) => {
-      // All operations use the same transactional manager
-      const order = await manager.save(Order, { userId, status: 'pending' });
-
-      for (const item of items) {
-        await manager.save(OrderItem, { orderId: order.id, ...item });
-        await manager.decrement(
-          Inventory,
-          { productId: item.productId },
-          'stock',
-          item.quantity,
-        );
-      }
-
-      // If this throws, everything rolls back
-      await this.paymentService.chargeWithManager(manager, order.id);
-
-      return order;
-    });
-  }
-}
-
-// QueryRunner for manual transaction control
-@Injectable()
-export class TransferService {
-  constructor(private dataSource: DataSource) {}
-
-  async transfer(fromId: string, toId: string, amount: number): Promise<void> {
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
-
-    try {
-      // Debit source account
-      await queryRunner.manager.decrement(
-        Account,
-        { id: fromId },
-        'balance',
-        amount,
-      );
-
-      // Verify sufficient funds
-      const source = await queryRunner.manager.findOne(Account, {
-        where: { id: fromId },
-      });
-      if (source.balance < 0) {
-        throw new BadRequestException('Insufficient funds');
-      }
-
-      // Credit destination account
-      await queryRunner.manager.increment(
-        Account,
-        { id: toId },
-        'balance',
-        amount,
-      );
-
-      // Log the transaction
-      await queryRunner.manager.save(TransactionLog, {
-        fromId,
-        toId,
-        amount,
-        timestamp: new Date(),
-      });
-
-      await queryRunner.commitTransaction();
-    } catch (error) {
-      await queryRunner.rollbackTransaction();
-      throw error;
-    } finally {
-      await queryRunner.release();
-    }
-  }
-}
-
-// Repository method with transaction support
-@Injectable()
-export class UsersRepository {
-  constructor(
-    @InjectRepository(User) private repo: Repository<User>,
-    private dataSource: DataSource,
-  ) {}
-
-  async createWithProfile(
-    userData: CreateUserDto,
-    profileData: CreateProfileDto,
-  ): Promise<User> {
-    return this.dataSource.transaction(async (manager) => {
-      const user = await manager.save(User, userData);
-      await manager.save(Profile, { ...profileData, userId: user.id });
-      return user;
-    });
-  }
-}
-```
-
-Reference: [TypeORM Transactions](https://typeorm.io/transactions)
+Reference: [TypeORM Find Options](https://typeorm.io/docs/working-with-entity-manager/find-options/)
 
 ---
 
@@ -3379,177 +2912,90 @@ Reference: [TypeORM Transactions](https://typeorm.io/transactions)
 
 **Impact: MEDIUM** — Response DTOs prevent accidental data exposure and ensure consistency
 
-Never return entity objects directly from controllers. Use response DTOs with class-transformer's `@Exclude()` and `@Expose()` decorators to control exactly what data is sent to clients. This prevents accidental exposure of sensitive fields and provides a stable API contract.
+Never return entities as the response contract. Declare a response DTO per shape and let one global `ClassSerializerInterceptor` turn whatever the handler returns into that DTO. The DTO must be deny-by-default: `@Expose()` alone does not hide anything. `plainToInstance(Dto, user)` copies every property of `user`, and `instanceToPlain` then emits all of them, so a DTO without a class-level `@Exclude()` leaks `passwordHash` the day someone adds it to the entity.
 
-**Incorrect (returning entities directly or manual spreading):**
+**Incorrect (entity returned directly; DTO with `@Expose()` only):**
 
 ```typescript
-// Return entities directly
-@Controller('users')
-export class UsersController {
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<User> {
-    return this.usersService.findById(id);
-    // Returns: { id, email, passwordHash, ssn, internalNotes, ... }
-    // Exposes sensitive data!
-  }
-}
-
-// Manual object spreading (error-prone)
 @Get(':id')
-async findOne(@Param('id') id: string) {
-  const user = await this.usersService.findById(id);
-  return {
-    id: user.id,
-    email: user.email,
-    name: user.name,
-    // Easy to forget to exclude sensitive fields
-    // Hard to maintain across endpoints
-  };
+findOne(@Param('id', ParseUUIDPipe) id: string): Promise<User> {
+  return this.usersService.findById(id); // { id, email, passwordHash, ... }
+}
+
+export class UserResponseDto {
+  @Expose() id: string;
+  @Expose() email: string;
+}
+
+@Get(':id')
+async findOne(@Param('id', ParseUUIDPipe) id: string): Promise<UserResponseDto> {
+  return plainToInstance(UserResponseDto, await this.usersService.findById(id));
+  // {"id":"u1","email":"a@x.io","name":"Ann","passwordHash":"h","createdAt":"1970-01-01T00:00:00.000Z"}
 }
 ```
 
-**Correct (use class-transformer with @Exclude and response DTOs):**
+**Correct (deny-by-default DTOs, one global serializer):**
 
 ```typescript
-// Enable class-transformer globally
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  app.useGlobalInterceptors(new ClassSerializerInterceptor(app.get(Reflector)));
-  await app.listen(3000);
-}
+// users/user-response.dto.ts
+import { Exclude, Expose } from 'class-transformer';
 
-// Entity with serialization control
-@Entity()
-export class User {
-  @PrimaryGeneratedColumn('uuid')
-  id: string;
-
-  @Column()
-  email: string;
-
-  @Column()
-  name: string;
-
-  @Column()
-  @Exclude() // Never include in responses
-  passwordHash: string;
-
-  @Column({ nullable: true })
-  @Exclude()
-  ssn: string;
-
-  @Column({ default: false })
-  @Exclude({ toPlainOnly: true }) // Exclude from response, allow in requests
-  isAdmin: boolean;
-
-  @CreateDateColumn()
-  createdAt: Date;
-
-  @Column()
-  @Exclude()
-  internalNotes: string;
-}
-
-// Now returning entity is safe
-@Controller('users')
-export class UsersController {
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<User> {
-    return this.usersService.findById(id);
-    // Returns: { id, email, name, createdAt }
-    // Sensitive fields excluded automatically
-  }
-}
-
-// For different response shapes, use explicit DTOs
+/** Class-level @Exclude(): only the properties declared with @Expose() reach the client. */
+@Exclude()
 export class UserResponseDto {
-  @Expose()
-  id: string;
-
-  @Expose()
-  email: string;
-
-  @Expose()
-  name: string;
-
-  @Expose()
-  @Transform(({ obj }) => obj.posts?.length || 0)
-  postCount: number;
-
-  constructor(partial: Partial<User>) {
-    Object.assign(this, partial);
-  }
+  @Expose() id: string;
+  @Expose() email: string;
+  @Expose() name: string;
 }
 
-export class UserDetailResponseDto extends UserResponseDto {
-  @Expose()
-  createdAt: Date;
-
-  @Expose()
-  @Type(() => PostResponseDto)
-  posts: PostResponseDto[];
+@Exclude()
+export class UserAdminDto extends UserResponseDto {
+  @Expose({ groups: ['admin'] }) createdAt: Date;
 }
+```
 
-// Controller with explicit DTOs
+```typescript
+// app.module.ts
+import { ClassSerializerInterceptor, Module } from '@nestjs/common';
+import { APP_INTERCEPTOR, Reflector } from '@nestjs/core';
+
+@Module({
+  providers: [
+    {
+      provide: APP_INTERCEPTOR,
+      inject: [Reflector],
+      // Default for every route: a class instance without a response DTO serializes to {} instead of every column.
+      useFactory: (reflector: Reflector) => new ClassSerializerInterceptor(reflector, { excludeExtraneousValues: true }),
+    },
+  ],
+})
+export class AppModule {}
+```
+
+```typescript
+// users/users.controller.ts
 @Controller('users')
 export class UsersController {
-  @Get()
-  @SerializeOptions({ type: UserResponseDto })
-  async findAll(): Promise<UserResponseDto[]> {
-    const users = await this.usersService.findAll();
-    return users.map(u => plainToInstance(UserResponseDto, u));
-  }
+  constructor(private readonly users: UsersService) {}
 
   @Get(':id')
-  async findOne(@Param('id') id: string): Promise<UserDetailResponseDto> {
-    const user = await this.usersService.findByIdWithPosts(id);
-    return plainToInstance(UserDetailResponseDto, user, {
-      excludeExtraneousValues: true,
-    });
-  }
-}
-
-// Groups for conditional serialization
-export class UserDto {
-  @Expose()
-  id: string;
-
-  @Expose()
-  name: string;
-
-  @Expose({ groups: ['admin'] })
-  email: string;
-
-  @Expose({ groups: ['admin'] })
-  createdAt: Date;
-
-  @Expose({ groups: ['admin', 'owner'] })
-  settings: UserSettings;
-}
-
-@Controller('users')
-export class UsersController {
-  @Get()
-  @SerializeOptions({ groups: ['public'] })
-  async findAllPublic(): Promise<UserDto[]> {
-    // Returns: { id, name }
+  @SerializeOptions({ type: UserResponseDto })
+  findOne(@Param('id', ParseUUIDPipe) id: string): Promise<UserResponseDto> {
+    return this.users.findById(id); // the interceptor converts the entity to UserResponseDto
   }
 
-  @Get('admin')
+  @Get(':id/admin')
   @UseGuards(AdminGuard)
-  @SerializeOptions({ groups: ['admin'] })
-  async findAllAdmin(): Promise<UserDto[]> {
-    // Returns: { id, name, email, createdAt }
-  }
-
-  @Get('me')
-  @SerializeOptions({ groups: ['owner'] })
-  async getProfile(@CurrentUser() user: User): Promise<UserDto> {
-    // Returns: { id, name, settings }
+  @SerializeOptions({ type: UserAdminDto, groups: ['admin'] })
+  findOneForAdmin(@Param('id', ParseUUIDPipe) id: string): Promise<UserAdminDto> {
+    return this.users.findById(id);
   }
 }
 ```
+
+Conversion lives in one place, the interceptor, so list and detail routes cannot diverge; handlers never call `plainToInstance` themselves. In the probe, a source object carrying `passwordHash` serialized to `{"id":"u1","email":"a@x.io","name":"Ann"}` through `UserResponseDto`, the admin route added `createdAt`, and the same DTO without the `admin` group omitted it. A class instance returned from a route with no `@SerializeOptions` serialized to `{}`. The interceptor only converts class instances: a plain object literal returned without `@SerializeOptions({ type })` passes through unchanged, so declare the type on every route.
+
+The interceptor is an `APP_INTERCEPTOR` provider, not `app.useGlobalInterceptors()` in `main.ts`, so e2e apps built from `AppModule` serialize the same way (`nestjs-testing` rule `e2e-global-enhancers-as-providers`); input validation goes the same way as an `APP_PIPE` (`api-use-pipes`).
 
 Reference: [NestJS Serialization](https://docs.nestjs.com/techniques/serialization)
 
@@ -3559,197 +3005,171 @@ Reference: [NestJS Serialization](https://docs.nestjs.com/techniques/serializati
 
 **Impact: MEDIUM-HIGH** — Interceptors provide clean separation for cross-cutting logic
 
-Interceptors can transform responses, add logging, handle caching, and measure performance without polluting your business logic. They wrap the route handler execution, giving you access to both the request and response streams.
+Interceptors wrap handler execution, so tracing, response envelopes, timeouts, caching and error mapping live in one place instead of every handler. Register global ones as `APP_INTERCEPTOR` providers so e2e apps built from `AppModule` get them too (`nestjs-testing` rule `e2e-global-enhancers-as-providers`). Async work started inside the pipe (a cache write) must be awaited and its failure handled; a rejected promise nobody awaits is an unhandled rejection. Log levels and call shape: `nestjs-logging`.
 
-**Incorrect (logging and transformation in every method):**
+**Incorrect (repeated per handler; unawaited cache write; message matching):**
 
 ```typescript
-// Logging in every controller method
-@Controller('users')
-export class UsersController {
-  @Get()
-  async findAll(): Promise<User[]> {
-    const start = Date.now();
-    this.logger.log('findAll called');
-
-    const users = await this.usersService.findAll();
-
-    this.logger.log(`findAll completed in ${Date.now() - start}ms`);
-    return users;
-  }
-
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<User> {
-    const start = Date.now();
-    this.logger.log(`findOne called with id: ${id}`);
-
-    const user = await this.usersService.findOne(id);
-
-    this.logger.log(`findOne completed in ${Date.now() - start}ms`);
-    return user;
-  }
-  // Repeated in every method!
+@Get(':id')
+async findOne(@Param('id') id: string): Promise<User> {
+  const start = Date.now();
+  this.logger.debug('findOne called', { id });
+  const user = await this.usersService.findOne(id);
+  this.logger.debug('findOne completed', { durationMs: Date.now() - start });
+  return user; // repeated in every method
 }
 
-// Manual response wrapping
-@Get()
-async findAll(): Promise<{ data: User[]; meta: Meta }> {
-  const users = await this.usersService.findAll();
-  return {
-    data: users,
-    meta: { timestamp: new Date(), count: users.length },
-  };
+const cached = await this.cacheManager.get(cacheKey);
+if (cached) return of(cached); // false, 0 and '' are recomputed every time
+return next.handle().pipe(
+  tap((response) => {
+    this.cacheManager.set(cacheKey, response, ttl); // not awaited: a failing store is an unhandled rejection
+  }),
+);
+
+if (error instanceof QueryFailedError && error.message.includes('duplicate')) {
+  throw new ConflictException(); // driver- and locale-specific; better-sqlite3 says "UNIQUE constraint failed"
 }
 ```
 
-**Correct (use interceptors for cross-cutting concerns):**
+**Correct (`common/interceptors.ts`):**
 
 ```typescript
-// Logging interceptor
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import {
+  ConflictException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+  RequestTimeoutException,
+  type CallHandler,
+  type ExecutionContext,
+  type NestInterceptor,
+} from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import type { Cache } from 'cache-manager';
+import type { Request, Response } from 'express';
+import { catchError, map, mergeMap, of, tap, throwError, timeout, TimeoutError, type Observable } from 'rxjs';
+import { EntityNotFoundError } from 'typeorm';
+import { isUniqueViolation } from '../database/is-unique-violation.js';
+
 @Injectable()
 export class LoggingInterceptor implements NestInterceptor {
-  private readonly logger = new Logger('HTTP');
+  private readonly logger = new Logger(LoggingInterceptor.name);
 
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
-    const request = context.switchToHttp().getRequest();
-    const { method, url, body } = request;
-    const now = Date.now();
-
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const { method, url } = context.switchToHttp().getRequest<Request>();
+    const start = Date.now();
+    // Per-request tracing at debug, values as fields. Failures are logged once, by the exception filter.
     return next.handle().pipe(
-      tap({
-        next: (data) => {
-          const response = context.switchToHttp().getResponse();
-          this.logger.log(
-            `${method} ${url} ${response.statusCode} - ${Date.now() - now}ms`,
-          );
-        },
-        error: (error) => {
-          this.logger.error(
-            `${method} ${url} ${error.status || 500} - ${Date.now() - now}ms`,
-            error.stack,
-          );
-        },
+      tap(() => {
+        const { statusCode } = context.switchToHttp().getResponse<Response>();
+        this.logger.debug('Request handled', { method, url, statusCode, durationMs: Date.now() - start });
       }),
     );
   }
 }
 
-// Response transformation interceptor
+export interface Envelope<T> {
+  data: T;
+  meta: { timestamp: string; path: string };
+}
+
 @Injectable()
-export class TransformInterceptor<T> implements NestInterceptor<T, Response<T>> {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<Response<T>> {
+export class EnvelopeInterceptor<T> implements NestInterceptor<T, Envelope<T>> {
+  intercept(context: ExecutionContext, next: CallHandler<T>): Observable<Envelope<T>> {
+    const path = context.switchToHttp().getRequest<Request>().url;
     return next.handle().pipe(
-      map((data) => ({
-        data,
-        meta: {
-          timestamp: new Date().toISOString(),
-          path: context.switchToHttp().getRequest().url,
-        },
-      })),
+      map((data) => ({ data, meta: { timestamp: new Date().toISOString(), path } })),
     );
   }
 }
 
-// Timeout interceptor
 @Injectable()
 export class TimeoutInterceptor implements NestInterceptor {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+  intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
     return next.handle().pipe(
       timeout(5000),
-      catchError((err) => {
-        if (err instanceof TimeoutError) {
-          throw new RequestTimeoutException('Request timed out');
+      catchError((err: unknown) =>
+        throwError(() => (err instanceof TimeoutError ? new RequestTimeoutException('Request timed out') : err)),
+      ),
+    );
+  }
+}
+
+/** TTL in milliseconds for HttpCacheInterceptor; the route's default applies without it. */
+export const CacheTtl = Reflector.createDecorator<number>();
+
+@Injectable()
+export class HttpCacheInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(HttpCacheInterceptor.name);
+
+  constructor(
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly reflector: Reflector,
+  ) {}
+
+  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<unknown>> {
+    const request = context.switchToHttp().getRequest<Request>();
+    if (request.method !== 'GET') return next.handle();
+
+    const key = `http:${request.originalUrl}`; // path + query string; never for per-user responses
+    const ttl = this.reflector.get(CacheTtl, context.getHandler()) ?? 300_000;
+
+    const cached = await this.cache.get<unknown>(key);
+    if (cached !== undefined) return of(cached); // false, 0 and '' are hits too
+
+    return next.handle().pipe(
+      mergeMap(async (response: unknown) => {
+        try {
+          await this.cache.set(key, response, ttl);
+        } catch (error) {
+          // Best effort: the response is still correct, only the next request is slower
+          const err = error instanceof Error ? error : new Error(String(error));
+          this.logger.warn('Cache write failed', { key }, err);
         }
-        throw err;
+        return response;
       }),
     );
   }
 }
 
-// Apply globally or per-controller
+/** Maps persistence errors the handler didn't handle to HTTP errors. */
+@Injectable()
+export class PersistenceErrorInterceptor implements NestInterceptor {
+  intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    return next.handle().pipe(
+      catchError((error: unknown) => {
+        if (error instanceof EntityNotFoundError) return throwError(() => new NotFoundException());
+        if (isUniqueViolation(error)) return throwError(() => new ConflictException('Resource already exists'));
+        return throwError(() => error);
+      }),
+    );
+  }
+}
+```
+
+```typescript
+// app.module.ts — global; per controller or route with @UseInterceptors(...)
 @Module({
   providers: [
     { provide: APP_INTERCEPTOR, useClass: LoggingInterceptor },
-    { provide: APP_INTERCEPTOR, useClass: TransformInterceptor },
+    { provide: APP_INTERCEPTOR, useClass: EnvelopeInterceptor },
   ],
 })
 export class AppModule {}
 
-// Or per-controller
-@Controller('users')
-@UseInterceptors(LoggingInterceptor)
-export class UsersController {
-  @Get()
-  async findAll(): Promise<User[]> {
-    // Clean business logic only
-    return this.usersService.findAll();
-  }
-}
-
-// Custom cache interceptor with TTL
-@Injectable()
-export class HttpCacheInterceptor implements NestInterceptor {
-  constructor(
-    private cacheManager: Cache,
-    private reflector: Reflector,
-  ) {}
-
-  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<any>> {
-    const request = context.switchToHttp().getRequest();
-
-    // Only cache GET requests
-    if (request.method !== 'GET') {
-      return next.handle();
-    }
-
-    const cacheKey = this.generateKey(request);
-    const ttl = this.reflector.get<number>('cacheTTL', context.getHandler()) || 300;
-
-    const cached = await this.cacheManager.get(cacheKey);
-    if (cached) {
-      return of(cached);
-    }
-
-    return next.handle().pipe(
-      tap((response) => {
-        this.cacheManager.set(cacheKey, response, ttl);
-      }),
-    );
-  }
-
-  private generateKey(request: Request): string {
-    return `cache:${request.url}:${JSON.stringify(request.query)}`;
-  }
-}
-
-// Usage with custom TTL
-@Get()
-@SetMetadata('cacheTTL', 600)
+// usage
+@Get('flags/:name')
+@CacheTtl(60_000)
 @UseInterceptors(HttpCacheInterceptor)
-async findAll(): Promise<User[]> {
-  return this.usersService.findAll();
-}
-
-// Error mapping interceptor
-@Injectable()
-export class ErrorMappingInterceptor implements NestInterceptor {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
-    return next.handle().pipe(
-      catchError((error) => {
-        if (error instanceof EntityNotFoundError) {
-          throw new NotFoundException(error.message);
-        }
-        if (error instanceof QueryFailedError) {
-          if (error.message.includes('duplicate')) {
-            throw new ConflictException('Resource already exists');
-          }
-        }
-        throw error;
-      }),
-    );
-  }
+isEnabled(@Param('name') name: string): Promise<boolean> {
+  return this.flags.isEnabled(name);
 }
 ```
+
+In the probe, a route returning `false` behind `HttpCacheInterceptor` ran once for two requests. With a cache store whose `set()` rejects, the request still returned 200 and the interceptor logged `warn('Cache write failed', { key: 'http:/skus/flag' }, Error('redis down'))`. Inserting a second row with the same `unique` code through `TransactionRunner` returned `409 {"message":"Resource already exists",…}`, and `findOneByOrFail` for a missing id returned `404` without echoing the query criteria that `EntityNotFoundError.message` contains. `isUniqueViolation` is the helper from `nestjs-typeorm` rule `orm-unique-violation`; when a service needs a different answer for a duplicate (return the existing row, `'duplicate'`), it catches there and the interceptor never sees it. The cache key is URL-only, so the interceptor is for responses that are the same for every caller; per-user keys and the stock `CacheInterceptor` are in `perf-use-caching`.
 
 Reference: [NestJS Interceptors](https://docs.nestjs.com/interceptors)
 
@@ -3759,200 +3179,141 @@ Reference: [NestJS Interceptors](https://docs.nestjs.com/interceptors)
 
 **Impact: MEDIUM** — Pipes ensure clean, validated data reaches your handlers
 
-Use built-in pipes like `ParseIntPipe`, `ParseUUIDPipe`, and `DefaultValuePipe` for common transformations. Create custom pipes for business-specific transformations. Pipes separate validation/transformation logic from controllers.
+Use the built-in pipes (`ParseUUIDPipe`, `ParseIntPipe`, `ParseEnumPipe`, `ParseArrayPipe`, `DefaultValuePipe`) for parameters, a custom pipe for a parsing rule the built-ins lack, and one global `ValidationPipe` for DTOs. A pipe or `@Transform` receives whatever the client sent: a repeated query key (`?search=a&search=b`) arrives as an array, and a JSON body field can be any type. Transforms run before class-validator, so a transform that calls string methods unguarded turns that input into a 500: `@Transform(({ value }) => value?.toLowerCase())` answered `?search=a&search=b` with `500 Internal server error` and logged `TypeError: value?.toLowerCase is not a function`. Check the type, and either throw `BadRequestException` (pipes) or return the value unchanged for the validators to reject (DTOs).
 
-**Incorrect (manual type parsing in handlers):**
+**Incorrect (manual parsing; unguarded transforms; validation only in `main.ts`):**
 
 ```typescript
-// Manual type parsing in handlers
+@Get()
+findAll(@Query('page') page: string, @Query('limit') limit: string): Promise<User[]> {
+  return this.usersService.findAll(parseInt(page) || 1, parseInt(limit) || 10); // ?page=abc silently becomes 1
+}
+
+export class FindProductsDto {
+  @IsOptional()
+  @Transform(({ value }) => value?.toLowerCase()) // array input: TypeError, 500
+  @IsString()
+  search?: string;
+}
+
+// main.ts — e2e apps built from AppModule run without it
+app.useGlobalPipes(new ValidationPipe({ transform: true, transformOptions: { enableImplicitConversion: true } }));
+```
+
+**Correct (built-in and custom pipes):**
+
+```typescript
 @Controller('users')
 export class UsersController {
   @Get(':id')
-  async findOne(@Param('id') id: string): Promise<User> {
-    // Manual validation in every handler
-    const uuid = id.trim();
-    if (!isUUID(uuid)) {
-      throw new BadRequestException('Invalid UUID');
-    }
-    return this.usersService.findOne(uuid);
+  findOne(@Param('id', ParseUUIDPipe) id: string): Promise<UserResponseDto> {
+    return this.users.findOne(id);
   }
 
   @Get()
-  async findAll(
-    @Query('page') page: string,
-    @Query('limit') limit: string,
-  ): Promise<User[]> {
-    // Manual parsing and defaults
-    const pageNum = parseInt(page) || 1;
-    const limitNum = parseInt(limit) || 10;
-    return this.usersService.findAll(pageNum, limitNum);
+  findAll(
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
+    @Query('limit', new DefaultValuePipe(10), ParseIntPipe) limit: number,
+  ): Promise<UserResponseDto[]> {
+    return this.users.findAll(page, limit);
   }
-}
-
-// Type coercion without validation
-@Get()
-async search(@Query('price') price: string): Promise<Product[]> {
-  const priceNum = +price; // NaN if invalid, no error
-  return this.productsService.findByPrice(priceNum);
 }
 ```
 
-**Correct (use built-in and custom pipes):**
-
 ```typescript
-// Use built-in pipes for common transformations
-@Controller('users')
-export class UsersController {
-  @Get(':id')
-  async findOne(@Param('id', ParseUUIDPipe) id: string): Promise<User> {
-    // id is guaranteed to be a valid UUID
-    return this.usersService.findOne(id);
-  }
+// common/pipes.ts
+import { BadRequestException, Injectable, type PipeTransform } from '@nestjs/common';
 
-  @Get()
-  async findAll(
-    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
-    @Query('limit', new DefaultValuePipe(10), ParseIntPipe) limit: number,
-  ): Promise<User[]> {
-    // Automatic defaults and type conversion
-    return this.usersService.findAll(page, limit);
-  }
-
-  @Get('by-status/:status')
-  async findByStatus(
-    @Param('status', new ParseEnumPipe(UserStatus)) status: UserStatus,
-  ): Promise<User[]> {
-    return this.usersService.findByStatus(status);
-  }
-}
-
-// Custom pipe for business logic
+/** Query/param values are strings, string arrays (repeated keys) or undefined; reject everything but one string. */
 @Injectable()
-export class ParseDatePipe implements PipeTransform<string, Date> {
-  transform(value: string): Date {
-    const date = new Date(value);
-    if (isNaN(date.getTime())) {
-      throw new BadRequestException('Invalid date format');
-    }
+export class ParseDatePipe implements PipeTransform<unknown, Date> {
+  transform(value: unknown): Date {
+    const date = typeof value === 'string' ? new Date(value) : new Date(Number.NaN);
+    if (Number.isNaN(date.getTime())) throw new BadRequestException('Expected an ISO 8601 date');
     return date;
   }
 }
 
-@Get('reports')
-async getReports(
-  @Query('from', ParseDatePipe) from: Date,
-  @Query('to', ParseDatePipe) to: Date,
-): Promise<Report[]> {
-  return this.reportsService.findBetween(from, to);
-}
-
-// Custom transformation pipes
 @Injectable()
-export class NormalizeEmailPipe implements PipeTransform<string, string> {
-  transform(value: string): string {
-    if (!value) return value;
+export class NormalizeEmailPipe implements PipeTransform<unknown, string | undefined> {
+  transform(value: unknown): string | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string') throw new BadRequestException('Expected a single email');
     return value.trim().toLowerCase();
   }
 }
+```
 
-// Parse comma-separated values
-@Injectable()
-export class ParseArrayPipe implements PipeTransform<string, string[]> {
-  transform(value: string): string[] {
-    if (!value) return [];
-    return value.split(',').map((v) => v.trim()).filter(Boolean);
-  }
+```typescript
+@Get('reports')
+findReports(@Query('from', ParseDatePipe) from: Date, @Query('to', ParseDatePipe) to: Date): Promise<ReportDto[]> {
+  return this.reports.findBetween(from, to);
 }
 
 @Get('products')
-async findProducts(
-  @Query('ids', ParseArrayPipe) ids: string[],
-  @Query('email', NormalizeEmailPipe) email: string,
-): Promise<Product[]> {
-  // ids is already an array, email is normalized
-  return this.productsService.findByIds(ids);
+findByIds(
+  @Query('ids', new ParseArrayPipe({ items: String, separator: ',' })) ids: string[],
+  @Query('email', NormalizeEmailPipe) email: string | undefined,
+): Promise<ProductDto[]> {
+  return this.products.findByIds(ids, email);
 }
 
-// Sanitize HTML input
-@Injectable()
-export class SanitizeHtmlPipe implements PipeTransform<string, string> {
-  transform(value: string): string {
-    if (!value) return value;
-    return sanitizeHtml(value, { allowedTags: [] });
-  }
+@Get('items/:id')
+findItem(
+  @Param('id', new ParseIntPipe({ exceptionFactory: () => new BadRequestException('id must be an integer') })) id: number,
+): Promise<ItemDto> {
+  return this.items.findOne(id);
 }
+```
 
-// Global validation pipe with transformation
-app.useGlobalPipes(
-  new ValidationPipe({
-    whitelist: true, // Strip non-DTO properties
-    transform: true, // Auto-transform to DTO types
-    transformOptions: {
-      enableImplicitConversion: true, // Convert query strings to numbers
-    },
-    forbidNonWhitelisted: true, // Throw on extra properties
-  }),
-);
+**Correct (DTO with guarded transforms, global `ValidationPipe` as `APP_PIPE`):**
 
-// DTO with transformation decorators
+```typescript
+import { Transform, Type } from 'class-transformer';
+import { IsArray, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+
 export class FindProductsDto {
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  page?: number = 1;
+  page: number = 1;
 
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
   @Max(100)
-  limit?: number = 10;
+  limit: number = 10;
 
+  // Transforms run before validation: touch strings only, leave anything else for @IsString to reject
   @IsOptional()
-  @Transform(({ value }) => value?.toLowerCase())
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim().toLowerCase() : value))
   @IsString()
   search?: string;
 
   @IsOptional()
-  @Transform(({ value }) => value?.split(','))
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.split(',') : value))
   @IsArray()
   @IsString({ each: true })
   categories?: string[];
 }
-
-@Get()
-async findAll(@Query() dto: FindProductsDto): Promise<Product[]> {
-  // dto is already transformed and validated
-  return this.productsService.findAll(dto);
-}
-
-// Pipe error customization
-@Injectable()
-export class CustomParseIntPipe extends ParseIntPipe {
-  constructor() {
-    super({
-      exceptionFactory: (error) =>
-        new BadRequestException(`${error} must be a valid integer`),
-    });
-  }
-}
-
-// Or use options on built-in pipes
-@Get(':id')
-async findOne(
-  @Param(
-    'id',
-    new ParseIntPipe({
-      errorHttpStatusCode: HttpStatus.NOT_ACCEPTABLE,
-      exceptionFactory: () => new NotAcceptableException('ID must be numeric'),
-    }),
-  )
-  id: number,
-): Promise<Item> {
-  return this.itemsService.findOne(id);
-}
 ```
+
+```typescript
+// app.module.ts
+@Module({
+  providers: [
+    {
+      provide: APP_PIPE,
+      useValue: new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+    },
+  ],
+})
+export class AppModule {}
+```
+
+Probe results: `?from=2026-01-01&from=2026-01-02` → `400 Expected an ISO 8601 date`; `?email=a@x.io&email=b@x.io` → `400 Expected a single email`; `?search=a&search=b` → `400 ["search must be a string"]`; `?search=ABC&categories=a,b&page=2` → `{"page":2,"limit":10,"search":"abc","categories":["a","b"]}`; `?page=x` → 400; `/items/abc` → `400 id must be an integer`. Conversion is explicit (`@Type(() => Number)`), not `enableImplicitConversion`, which also converts a number sent for a string field into a string that passes `@IsString()` (`security-validate-all-input`). `ParseArrayPipe` is Nest's; don't shadow it with a custom class of the same name. HTML sanitization is `security-sanitize-output`. `APP_PIPE` puts validation in the module graph, so e2e apps validate like production (`nestjs-testing` rule `e2e-global-enhancers-as-providers`).
 
 Reference: [NestJS Pipes](https://docs.nestjs.com/pipes)
 
@@ -3962,186 +3323,148 @@ Reference: [NestJS Pipes](https://docs.nestjs.com/pipes)
 
 **Impact: MEDIUM** — Versioning allows you to evolve APIs without breaking existing clients
 
-Use NestJS built-in versioning when making breaking changes to your API. Choose a versioning strategy (URI, header, or media type) and apply it consistently. This allows old clients to continue working while new clients use updated endpoints.
+Use Nest's built-in versioning when a response or request contract changes incompatibly. Pick one strategy (URI, header or media type) for the whole API and enable it once in `configureApp()`, so production and every e2e app route the same way. Let the router select the handler with `version` / `@Version()`; each version's controller returns its own typed DTO, and the service underneath stays version-neutral. Version branching inside a service (`findOne(id, version): Promise<any>`) bypasses the router, accepts versions nobody supports, and hides each version's contract.
 
-**Incorrect (breaking changes without versioning):**
+**Incorrect (breaking change in place; version selected by hand):**
 
 ```typescript
-// Breaking changes without versioning
-@Controller('users')
-export class UsersController {
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<User> {
-    // Original response: { id, name, email }
-    // Later changed to: { id, firstName, lastName, emailAddress }
-    // Old clients break!
-    return this.usersService.findOne(id);
-  }
+@Get(':id')
+findOne(@Param('id') id: string): Promise<User> {
+  // v1 clients expected { id, name, email }; now { id, firstName, lastName, emailAddress }
+  return this.usersService.findOne(id);
 }
 
-// Manual versioning in routes
-@Controller('v1/users')
-export class UsersV1Controller {}
-
-@Controller('v2/users')
-export class UsersV2Controller {}
-// Inconsistent, error-prone, hard to maintain
+@Get(':id')
+findOne(@Param('id') id: string, @Headers('X-API-Version') version = '1'): Promise<any> {
+  return this.usersService.findOne(id, version); // any version string reaches the service
+}
 ```
 
-**Correct (use NestJS built-in versioning):**
+**Correct (`src/configure-app.ts`):**
 
 ```typescript
-// Enable versioning in main.ts
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+import { VersioningType } from '@nestjs/common';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 
-  // URI versioning: /v1/users, /v2/users
-  app.enableVersioning({
-    type: VersioningType.URI,
-    defaultVersion: '1',
-  });
+/** Settings production and tests share; main.ts and createTestApp call this. */
+export function configureApp(app: NestExpressApplication): NestExpressApplication {
+  return app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' }); // /v1/users, /v2/users
+}
+```
 
-  // Or header versioning: X-API-Version: 1
-  app.enableVersioning({
-    type: VersioningType.HEADER,
-    header: 'X-API-Version',
-    defaultVersion: '1',
-  });
+Header (`{ type: VersioningType.HEADER, header: 'X-API-Version' }`) and media-type (`{ type: VersioningType.MEDIA_TYPE, key: 'v=' }`) versioning are alternatives to URI versioning, not additions: `enableVersioning` is called once.
 
-  // Or media type: Accept: application/json;v=1
-  app.enableVersioning({
-    type: VersioningType.MEDIA_TYPE,
-    key: 'v=',
-    defaultVersion: '1',
-  });
+**Correct (version-specific controllers over a version-neutral service):**
 
-  await app.listen(3000);
+```typescript
+import {
+  Controller,
+  Get,
+  Injectable,
+  NotFoundException,
+  Param,
+  UseInterceptors,
+  type CallHandler,
+  type ExecutionContext,
+  type NestInterceptor,
+} from '@nestjs/common';
+import type { Response } from 'express';
+import type { Observable } from 'rxjs';
+
+export interface User {
+  id: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  createdAt: Date;
 }
 
-// Version-specific controllers
-@Controller('users')
-@Version('1')
-export class UsersV1Controller {
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<UserV1Response> {
-    const user = await this.usersService.findOne(id);
-    // V1 response format
-    return {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-    };
-  }
-}
-
-@Controller('users')
-@Version('2')
-export class UsersV2Controller {
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<UserV2Response> {
-    const user = await this.usersService.findOne(id);
-    // V2 response format with breaking changes
-    return {
-      id: user.id,
-      firstName: user.firstName,
-      lastName: user.lastName,
-      emailAddress: user.email,
-      createdAt: user.createdAt,
-    };
-  }
-}
-
-// Per-route versioning - different versions for different routes
-@Controller('users')
-export class UsersController {
-  @Get()
-  @Version('1')
-  findAllV1(): Promise<UserV1Response[]> {
-    return this.usersService.findAllV1();
-  }
-
-  @Get()
-  @Version('2')
-  findAllV2(): Promise<UserV2Response[]> {
-    return this.usersService.findAllV2();
-  }
-
-  @Get(':id')
-  @Version(['1', '2']) // Same handler for multiple versions
-  findOne(@Param('id') id: string): Promise<User> {
-    return this.usersService.findOne(id);
-  }
-
-  @Post()
-  @Version(VERSION_NEUTRAL) // Available in all versions
-  create(@Body() dto: CreateUserDto): Promise<User> {
-    return this.usersService.create(dto);
-  }
-}
-
-// Shared service with version-specific logic
+/** Version-neutral domain logic; knows nothing about response shapes. */
 @Injectable()
 export class UsersService {
-  async findOne(id: string, version: string): Promise<any> {
-    const user = await this.repo.findOne({ where: { id } });
+  private readonly users = new Map<string, User>([
+    ['u1', { id: 'u1', firstName: 'Ann', lastName: 'Lee', email: 'ann@x.io', createdAt: new Date(0) }],
+  ]);
 
-    if (version === '1') {
-      return this.toV1Response(user);
-    }
-    return this.toV2Response(user);
-  }
-
-  private toV1Response(user: User): UserV1Response {
-    return {
-      id: user.id,
-      name: `${user.firstName} ${user.lastName}`,
-      email: user.email,
-    };
-  }
-
-  private toV2Response(user: User): UserV2Response {
-    return {
-      id: user.id,
-      firstName: user.firstName,
-      lastName: user.lastName,
-      emailAddress: user.email,
-      createdAt: user.createdAt,
-    };
+  async findOne(id: string): Promise<User> {
+    const user = this.users.get(id);
+    if (!user) throw new NotFoundException();
+    return user;
   }
 }
 
-// Controller extracts version
-@Controller('users')
-export class UsersController {
-  @Get(':id')
-  async findOne(
-    @Param('id') id: string,
-    @Headers('X-API-Version') version: string = '1',
-  ): Promise<any> {
-    return this.usersService.findOne(id, version);
-  }
+export interface UserV1Dto {
+  id: string;
+  name: string;
+  email: string;
 }
 
-// Deprecation strategy - mark old versions as deprecated
-@Controller('users')
-@Version('1')
-@UseInterceptors(DeprecationInterceptor)
-export class UsersV1Controller {
-  // All V1 routes will include deprecation warning
+export interface UserV2Dto {
+  id: string;
+  firstName: string;
+  lastName: string;
+  emailAddress: string;
+  createdAt: string;
 }
 
+/** Illustrative: announce the real date with the v2 release and keep it in one place. */
+const V1_DEPRECATED_AT = new Date('2026-11-01T00:00:00Z');
+const V1_SUNSET_AT = new Date('2027-11-01T00:00:00Z');
+
+/** RFC 9745 Deprecation + RFC 8594 Sunset headers on every v1 response. */
 @Injectable()
-export class DeprecationInterceptor implements NestInterceptor {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
-    const response = context.switchToHttp().getResponse();
-    response.setHeader('Deprecation', 'true');
-    response.setHeader('Sunset', 'Sat, 1 Jan 2025 00:00:00 GMT');
+export class V1DeprecationInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const response = context.switchToHttp().getResponse<Response>();
+    response.setHeader('Deprecation', `@${V1_DEPRECATED_AT.getTime() / 1000}`);
+    response.setHeader('Sunset', V1_SUNSET_AT.toUTCString());
     response.setHeader('Link', '</v2/users>; rel="successor-version"');
-
     return next.handle();
   }
 }
+
+@Controller({ path: 'users', version: '1' })
+@UseInterceptors(V1DeprecationInterceptor)
+export class UsersV1Controller {
+  constructor(private readonly users: UsersService) {}
+
+  @Get(':id')
+  async findOne(@Param('id') id: string): Promise<UserV1Dto> {
+    const user = await this.users.findOne(id);
+    return { id: user.id, name: `${user.firstName} ${user.lastName}`, email: user.email };
+  }
+}
+
+@Controller({ path: 'users', version: '2' })
+export class UsersV2Controller {
+  constructor(private readonly users: UsersService) {}
+
+  @Get(':id')
+  async findOne(@Param('id') id: string): Promise<UserV2Dto> {
+    const user = await this.users.findOne(id);
+    return {
+      id: user.id,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      emailAddress: user.email,
+      createdAt: user.createdAt.toISOString(),
+    };
+  }
+}
 ```
+
+```typescript
+// Routes that don't change between versions
+@Controller({ path: 'status', version: VERSION_NEUTRAL })
+export class StatusController {
+  @Get()
+  status(): { ok: true } {
+    return { ok: true };
+  }
+}
+```
+
+Probe results: `GET /v1/users/u1` → `{"id":"u1","name":"Ann Lee","email":"ann@x.io"}` with `Deprecation: @1793491200` and `Sunset: Mon, 01 Nov 2027 00:00:00 GMT`; `GET /v2/users/u1` → the v2 shape without those headers; `/v3/users/u1` → 404; `/status` → 200 while `/v2/status` → 404. With URI versioning a versioned route exists only under its prefix, so unversioned `/users/u1` is 404; `defaultVersion` only assigns a version to controllers that declare none. The dates are illustrative: set them when v2 ships, give clients a migration window, and remove v1 only after its traffic is gone. Response DTOs and serialization: `api-use-dto-serialization`.
 
 Reference: [NestJS Versioning](https://docs.nestjs.com/techniques/versioning)
 
@@ -4155,220 +3478,146 @@ Reference: [NestJS Versioning](https://docs.nestjs.com/techniques/versioning)
 
 **Impact: MEDIUM-HIGH** — Health checks enable orchestrators to manage service lifecycle
 
-Implement liveness and readiness probes using `@nestjs/terminus`. Liveness checks determine if the service should be restarted. Readiness checks determine if the service can accept traffic. Proper health checks enable Kubernetes and load balancers to route traffic correctly.
+Expose liveness and readiness with `@nestjs/terminus`. Liveness answers "is the process stuck?" and restarts the container when it fails, so it checks no dependencies: a database outage that fails liveness restarts every pod at once and fixes nothing. Readiness answers "can this instance serve traffic now?" and checks the dependencies every request needs, each with a timeout shorter than the probe's. Check each dependency with its own protocol: Redis speaks RESP, so `HttpHealthIndicator.pingCheck('redis', 'http://redis:6379')` fails against a healthy server; use the Redis client's `PING`. Keep third-party APIs out of readiness: their outage would take every instance out of the load balancer while the endpoints that don't need them could still serve.
 
-**Incorrect (simple ping that doesn't check dependencies):**
+**Incorrect (static OK; Redis probed over HTTP; dependencies in liveness):**
 
 ```typescript
-// Simple ping that doesn't check dependencies
-@Controller('health')
-export class HealthController {
-  @Get()
-  check(): string {
-    return 'OK'; // Service might be unhealthy but returns OK
-  }
+@Get('health')
+check(): string {
+  return 'OK'; // 200 while the database is unreachable
 }
 
-// Health check that blocks on slow dependencies
-@Controller('health')
-export class HealthController {
-  @Get()
-  async check(): Promise<string> {
-    // If database is slow, health check times out
-    await this.userRepo.findOne({ where: { id: '1' } });
-    await this.redis.ping();
-    await this.externalApi.healthCheck();
-    return 'OK';
+@Get('live')
+@HealthCheck()
+liveness() {
+  return this.health.check([() => this.db.pingCheck('database')]); // a DB outage restarts every pod
+}
+
+@Get('ready')
+@HealthCheck()
+readiness() {
+  return this.health.check([
+    () => this.http.pingCheck('redis', 'http://redis:6379'), // not HTTP: always down
+    () => this.http.pingCheck('payments', 'https://api.payments.example/health'), // a third party's outage drains you
+  ]);
+}
+```
+
+**Correct (`health/redis.health.ts`):**
+
+```typescript
+import { Injectable } from '@nestjs/common';
+import { HealthIndicatorService } from '@nestjs/terminus';
+import { Redis } from 'ioredis';
+
+/** Redis speaks RESP, not HTTP: check it with the client's own PING. */
+@Injectable()
+export class RedisHealthIndicator {
+  constructor(
+    private readonly redis: Redis,
+    private readonly health: HealthIndicatorService,
+  ) {}
+
+  pingCheck(key: string) {
+    return this.health
+      .check(key)
+      .attempt(async () => {
+        await this.redis.ping();
+      })
+      .withTimeout(1000);
   }
 }
 ```
 
-**Correct (use @nestjs/terminus for comprehensive health checks):**
+**Correct (`health/health.controller.ts`):**
 
 ```typescript
-// Use @nestjs/terminus for comprehensive health checks
-import {
-  HealthCheckService,
-  HttpHealthIndicator,
-  TypeOrmHealthIndicator,
-  HealthCheck,
-  DiskHealthIndicator,
-  MemoryHealthIndicator,
-} from '@nestjs/terminus';
+import { Controller, Get } from '@nestjs/common';
+import { HealthCheck, HealthCheckService, TypeOrmHealthIndicator } from '@nestjs/terminus';
+import { RedisHealthIndicator } from './redis.health.js';
 
 @Controller('health')
 export class HealthController {
   constructor(
-    private health: HealthCheckService,
-    private http: HttpHealthIndicator,
-    private db: TypeOrmHealthIndicator,
-    private disk: DiskHealthIndicator,
-    private memory: MemoryHealthIndicator,
+    private readonly health: HealthCheckService,
+    private readonly db: TypeOrmHealthIndicator,
+    private readonly redis: RedisHealthIndicator,
   ) {}
 
-  // Liveness probe - is the service alive?
+  /** Liveness: the process answers. No dependencies, or one outage restarts every pod at once. */
   @Get('live')
   @HealthCheck()
   liveness() {
-    return this.health.check([
-      // Basic checks only
-      () => this.memory.checkHeap('memory_heap', 200 * 1024 * 1024), // 200MB
-    ]);
+    return this.health.check([]);
   }
 
-  // Readiness probe - can the service handle traffic?
+  /** Readiness: can this instance serve traffic right now? */
   @Get('ready')
   @HealthCheck()
   readiness() {
     return this.health.check([
-      () => this.db.pingCheck('database'),
-      () =>
-        this.http.pingCheck('redis', 'http://redis:6379', { timeout: 1000 }),
-      () =>
-        this.disk.checkStorage('disk', { path: '/', thresholdPercent: 0.9 }),
+      () => this.db.pingCheck('database').withTimeout(1000),
+      () => this.redis.pingCheck('redis'),
     ]);
   }
-
-  // Deep health check for debugging
-  @Get('deep')
-  @HealthCheck()
-  deepCheck() {
-    return this.health.check([
-      () => this.db.pingCheck('database'),
-      () => this.memory.checkHeap('memory_heap', 200 * 1024 * 1024),
-      () => this.memory.checkRSS('memory_rss', 300 * 1024 * 1024),
-      () =>
-        this.disk.checkStorage('disk', { path: '/', thresholdPercent: 0.9 }),
-      () =>
-        this.http.pingCheck('external-api', 'https://api.example.com/health'),
-    ]);
-  }
-}
-
-// Custom indicator for business-specific health
-@Injectable()
-export class QueueHealthIndicator extends HealthIndicator {
-  constructor(private queueService: QueueService) {
-    super();
-  }
-
-  async isHealthy(key: string): Promise<HealthIndicatorResult> {
-    const queueStats = await this.queueService.getStats();
-
-    const isHealthy = queueStats.failedCount < 100;
-    const result = this.getStatus(key, isHealthy, {
-      waiting: queueStats.waitingCount,
-      active: queueStats.activeCount,
-      failed: queueStats.failedCount,
-    });
-
-    if (!isHealthy) {
-      throw new HealthCheckError('Queue unhealthy', result);
-    }
-
-    return result;
-  }
-}
-
-// Redis health indicator
-@Injectable()
-export class RedisHealthIndicator extends HealthIndicator {
-  constructor(@InjectRedis() private redis: Redis) {
-    super();
-  }
-
-  async isHealthy(key: string): Promise<HealthIndicatorResult> {
-    try {
-      const pong = await this.redis.ping();
-      return this.getStatus(key, pong === 'PONG');
-    } catch (error) {
-      throw new HealthCheckError('Redis check failed', this.getStatus(key, false));
-    }
-  }
-}
-
-// Use custom indicators
-@Get('ready')
-@HealthCheck()
-readiness() {
-  return this.health.check([
-    () => this.db.pingCheck('database'),
-    () => this.redis.isHealthy('redis'),
-    () => this.queue.isHealthy('job-queue'),
-  ]);
-}
-
-// Graceful shutdown handling
-@Injectable()
-export class GracefulShutdownService implements OnApplicationShutdown {
-  private isShuttingDown = false;
-
-  isShutdown(): boolean {
-    return this.isShuttingDown;
-  }
-
-  async onApplicationShutdown(signal: string): Promise<void> {
-    this.isShuttingDown = true;
-    console.log(`Shutting down on ${signal}`);
-
-    // Wait for in-flight requests
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-  }
-}
-
-// Health check respects shutdown state
-@Get('ready')
-@HealthCheck()
-readiness() {
-  if (this.shutdownService.isShutdown()) {
-    throw new ServiceUnavailableException('Shutting down');
-  }
-
-  return this.health.check([
-    () => this.db.pingCheck('database'),
-  ]);
 }
 ```
+
+**Correct (`health/health.module.ts`):**
+
+```typescript
+import { Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { TerminusModule } from '@nestjs/terminus';
+import type { Env } from '../config/env.validation.js';
+import { HealthController } from './health.controller.js';
+import { RedisHealthIndicator } from './redis.health.js';
+
+@Module({
+  imports: [
+    TerminusModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService<Env, true>) => ({
+        // On SIGTERM: every health check answers 503 "shutting_down", then shutdown waits this long
+        gracefulShutdownTimeoutMs: config.get('SHUTDOWN_DRAIN_MS', { infer: true }),
+      }),
+    }),
+  ],
+  controllers: [HealthController],
+  providers: [RedisHealthIndicator],
+})
+export class HealthModule {}
+```
+
+`Redis` is the shared client from `perf-async-hooks`. Custom indicators use `HealthIndicatorService`: `@nestjs/terminus` 12.1.0 no longer exports the `HealthIndicator` base class or `HealthCheckError` that older examples extend and throw. `check(key).attempt(fn).withTimeout(ms)` marks the key `down` when `fn` throws or runs past the timeout; the built-in indicators return the same attempt, and `pingCheck(key, { timeout })` is deprecated in 12.1.0 in favour of `.withTimeout(ms)`. `SHUTDOWN_DRAIN_MS` is a validated `Env` key (`Joi.number().integer().min(0).default(10_000)`, `devops-use-config-module`): `abc` stopped startup with `Config validation error: SHUTDOWN_DRAIN_MS: "SHUTDOWN_DRAIN_MS" must be a number`, and unset it drained 10000 ms. In the probe (better-sqlite3 database, Redis 8.10.2), `/health/ready` returned 200 with `{"database":{"status":"up"},"redis":{"status":"up"}}` (plus `responseTime`); against a stub that answered `PING` after 3 s it returned 503 after 1022 ms with `{"redis":{"message":"timeout of 1000ms exceeded","responseTime":1003,"status":"down"}}`. `gracefulShutdownTimeoutMs` turns both endpoints into 503 `shutting_down` on `SIGTERM`; the shutdown sequence is `devops-graceful-shutdown`.
 
 ### Kubernetes Configuration
 
 ```yaml
-# Kubernetes deployment with probes
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: api-service
 spec:
   template:
     spec:
+      terminationGracePeriodSeconds: 30 # > SHUTDOWN_DRAIN_MS + the longest request
       containers:
         - name: api
-          image: api-service:latest
+          image: api-service:1.4.2
           ports:
             - containerPort: 3000
+          startupProbe:
+            httpGet: { path: /health/live, port: 3000 }
+            periodSeconds: 5
+            failureThreshold: 30
           livenessProbe:
-            httpGet:
-              path: /health/live
-              port: 3000
-            initialDelaySeconds: 30
+            httpGet: { path: /health/live, port: 3000 }
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
-            httpGet:
-              path: /health/ready
-              port: 3000
-            initialDelaySeconds: 5
+            httpGet: { path: /health/ready, port: 3000 }
             periodSeconds: 5
-            timeoutSeconds: 3
-            failureThreshold: 3
-          startupProbe:
-            httpGet:
-              path: /health/live
-              port: 3000
-            initialDelaySeconds: 0
-            periodSeconds: 5
-            failureThreshold: 30
+            timeoutSeconds: 3 # above the 1 s indicator timeouts
+            failureThreshold: 2
 ```
 
 Reference: [NestJS Terminus](https://docs.nestjs.com/recipes/terminus)
@@ -4379,162 +3628,131 @@ Reference: [NestJS Terminus](https://docs.nestjs.com/recipes/terminus)
 
 **Impact: MEDIUM** — Proper patterns ensure reliable microservice communication
 
-NestJS microservices support two communication patterns: request-response (MessagePattern) and event-based (EventPattern). Use MessagePattern when you need a response, and EventPattern for fire-and-forget notifications. Understanding the difference prevents communication bugs.
+`@nestjs/microservices` has two patterns. `send()` + `@MessagePattern` is request-response: use it when the caller needs the answer to continue, and bound the wait with `timeout()`. `emit()` + `@EventPattern` is fire-and-forget: the handler's return value is discarded and the sender never learns whether it ran. An `emit()` after a commit is best-effort: a crash between the commit and the emit, or a broker that is down, loses the event. That is acceptable for analytics or cache warming; for anything that must happen (a welcome mail, a stock reservation, a downstream sync) write an outbox row in the same transaction and dispatch from it with the retry and dead-letter policy of `nestjs-resilience` (`resilience-dispatch-after-commit`, `dlq-record-final-failure`). Consumers of either kind must tolerate duplicates (`idempotency-processed-events`).
 
-**Incorrect (using wrong pattern for use case):**
+**Incorrect (wrong pattern; unbounded wait; compensating delete after a remote call):**
 
 ```typescript
-// Use @MessagePattern for fire-and-forget
-@Controller()
-export class NotificationsController {
-  @MessagePattern('user.created')
-  async handleUserCreated(data: UserCreatedEvent) {
-    // This WAITS for response, blocking the sender
-    await this.emailService.sendWelcome(data.email);
-    // If email fails, sender gets an error (coupling!)
-  }
+@MessagePattern('user.created') // the sender waits for a mail to be sent
+async handleUserCreated(data: UserCreatedEvent) {
+  await this.emailService.sendWelcome(data.email);
 }
 
-// Use @EventPattern expecting a response
-@Controller()
-export class OrdersController {
-  @EventPattern('inventory.check')
-  async checkInventory(data: CheckInventoryDto) {
-    const available = await this.inventory.check(data);
-    return available; // This return value is IGNORED with @EventPattern!
-  }
+@EventPattern('inventory.check')
+async checkInventory(data: CheckInventoryDto) {
+  return this.inventory.check(data); // discarded: events have no reply
 }
 
-// Tight coupling in client
+async createOrder(dto: CreateOrderDto): Promise<Order> {
+  const order = await this.repo.save(dto);
+  const reserved = await firstValueFrom(this.inventory.send({ cmd: 'reserve' }, { orderId: order.id })); // no timeout
+  if (!reserved.success) await this.repo.delete(order.id);
+  // a lost reply after a successful reservation leaves stock reserved for a deleted order;
+  // a crash between the steps leaves an order nobody reserved stock for
+  return order;
+}
+```
+
+**Correct (request-response: `inventory/inventory.controller.ts` and the caller):**
+
+```typescript
+import { Controller } from '@nestjs/common';
+import { MessagePattern, Payload, RpcException } from '@nestjs/microservices';
+import type { CheckStock, StockLevel } from './contracts.js';
+
+/** Inventory service side: answers a query; the reply goes back to the caller. */
+@Controller()
+export class InventoryController {
+  private readonly stock = new Map([['p1', 5]]);
+
+  @MessagePattern({ cmd: 'check_stock' })
+  checkStock(@Payload() query: CheckStock): StockLevel {
+    const onHand = this.stock.get(query.productId);
+    if (onHand === undefined) throw new RpcException({ status: 404, message: 'Unknown product' });
+    return { productId: query.productId, available: onHand >= query.quantity };
+  }
+}
+```
+
+```typescript
+import { Inject, Injectable } from '@nestjs/common';
+import { ClientProxy } from '@nestjs/microservices';
+import { firstValueFrom, timeout } from 'rxjs';
+import { INVENTORY_CLIENT, type CheckStock, type StockLevel } from './contracts.js';
+
+/** Caller side of a request-response pattern: always bound the wait. */
+@Injectable()
+export class StockClient {
+  constructor(@Inject(INVENTORY_CLIENT) private readonly inventory: ClientProxy) {}
+
+  check(query: CheckStock): Promise<StockLevel> {
+    return firstValueFrom(
+      this.inventory.send<StockLevel, CheckStock>({ cmd: 'check_stock' }, query).pipe(timeout(2000)),
+    );
+  }
+}
+```
+
+**Correct (best-effort event after commit, failure observed):**
+
+```typescript
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { ClientProxy } from '@nestjs/microservices';
+import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+import { TransactionRunner } from '../database/transaction-runner.js';
+import { EVENTS_CLIENT, type UserCreated } from './contracts.js';
+
+@Entity('users')
+export class User {
+  @PrimaryGeneratedColumn('uuid') id: string;
+  @Column({ unique: true }) email: string;
+}
+
 @Injectable()
 export class UsersService {
-  async createUser(dto: CreateUserDto): Promise<User> {
-    const user = await this.repo.save(dto);
+  private readonly logger = new Logger(UsersService.name);
 
-    // Blocks until notification service responds
-    await this.client.send('user.created', user).toPromise();
-    // If notification service is down, user creation fails!
+  constructor(
+    private readonly transactions: TransactionRunner,
+    @Inject(EVENTS_CLIENT) private readonly events: ClientProxy,
+  ) {}
 
+  async create(email: string): Promise<User> {
+    const user = await this.transactions.run((manager) => manager.save(User, { email }));
+    // Best effort, after commit: lost on a crash before this line or when the broker is down
+    const event: UserCreated = { userId: user.id, occurredAt: new Date().toISOString() };
+    this.events.emit<void, UserCreated>('user.created', event).subscribe({
+      error: (error: unknown) => {
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.logger.warn('Event not published', { pattern: 'user.created', userId: user.id }, err);
+      },
+    });
     return user;
   }
 }
 ```
 
-**Correct (use MessagePattern for request-response, EventPattern for fire-and-forget):**
-
 ```typescript
-// MessagePattern: Request-Response (when you NEED a response)
-@Controller()
-export class InventoryController {
-  @MessagePattern({ cmd: 'check_inventory' })
-  async checkInventory(data: CheckInventoryDto): Promise<InventoryResult> {
-    const result = await this.inventoryService.check(data.productId, data.quantity);
-    return result; // Response sent back to caller
-  }
-}
+import { Controller } from '@nestjs/common';
+import { EventPattern, Payload } from '@nestjs/microservices';
+import type { UserCreated } from './contracts.js';
+import { WelcomeMailer } from './welcome-mailer.js';
 
-// Client expects response
-@Injectable()
-export class OrdersService {
-  async createOrder(dto: CreateOrderDto): Promise<Order> {
-    // Check inventory - we NEED this response to proceed
-    const inventory = await firstValueFrom(
-      this.inventoryClient.send<InventoryResult>(
-        { cmd: 'check_inventory' },
-        { productId: dto.productId, quantity: dto.quantity },
-      ),
-    );
-
-    if (!inventory.available) {
-      throw new BadRequestException('Insufficient inventory');
-    }
-
-    return this.repo.save(dto);
-  }
-}
-
-// EventPattern: Fire-and-Forget (for notifications, side effects)
+/** Consumer side of an event: no reply; the sender never learns about failures here. */
 @Controller()
 export class NotificationsController {
+  constructor(private readonly mailer: WelcomeMailer) {}
+
   @EventPattern('user.created')
-  async handleUserCreated(data: UserCreatedEvent): Promise<void> {
-    // No return value needed - just process the event
-    await this.emailService.sendWelcome(data.email);
-    await this.analyticsService.track('user_signup', data);
-    // If this fails, it doesn't affect the sender
-  }
-}
-
-// Client emits event without waiting
-@Injectable()
-export class UsersService {
-  async createUser(dto: CreateUserDto): Promise<User> {
-    const user = await this.repo.save(dto);
-
-    // Fire and forget - doesn't block, doesn't wait
-    this.eventClient.emit('user.created', {
-      userId: user.id,
-      email: user.email,
-      timestamp: new Date(),
-    });
-
-    return user; // User creation succeeds regardless of event handling
-  }
-}
-
-// Hybrid pattern for critical events
-@Injectable()
-export class OrdersService {
-  async createOrder(dto: CreateOrderDto): Promise<Order> {
-    const order = await this.repo.save(dto);
-
-    // Critical: inventory reservation (use MessagePattern)
-    const reserved = await firstValueFrom(
-      this.inventoryClient.send({ cmd: 'reserve_inventory' }, {
-        orderId: order.id,
-        items: dto.items,
-      }),
-    );
-
-    if (!reserved.success) {
-      await this.repo.delete(order.id);
-      throw new BadRequestException('Could not reserve inventory');
-    }
-
-    // Non-critical: notifications (use EventPattern)
-    this.eventClient.emit('order.created', {
-      orderId: order.id,
-      userId: dto.userId,
-      total: dto.total,
-    });
-
-    return order;
-  }
-}
-
-// Error handling patterns
-// MessagePattern errors propagate to caller
-@MessagePattern({ cmd: 'get_user' })
-async getUser(userId: string): Promise<User> {
-  const user = await this.repo.findOne({ where: { id: userId } });
-  if (!user) {
-    throw new RpcException('User not found'); // Received by caller
-  }
-  return user;
-}
-
-// EventPattern errors should be handled locally
-@EventPattern('order.created')
-async handleOrderCreated(data: OrderCreatedEvent): Promise<void> {
-  try {
-    await this.processOrder(data);
-  } catch (error) {
-    // Log and potentially retry - don't throw
-    this.logger.error('Failed to process order event', error);
-    await this.deadLetterQueue.add(data);
+  async onUserCreated(@Payload() event: UserCreated): Promise<void> {
+    await this.mailer.send(event.userId); // idempotent per userId: events can arrive twice
   }
 }
 ```
+
+Probe results (TCP transport, `@nestjs/microservices` 12.3.2): `check({ productId: 'p1', quantity: 3 })` resolved `{"productId":"p1","available":true}`; an unknown product rejected the caller with `{"status":404,"message":"Unknown product"}` from the `RpcException`; `create()` committed the user and the `user.created` handler received its id. With the events client pointed at a closed port, `create()` still returned the committed user and logged `warn('Event not published', { pattern: 'user.created', userId }, AggregateError('connect ECONNREFUSED ::1:31499'))`. The `subscribe({ error })` is what makes that failure visible; it does not retry or keep the event.
+
+An order that needs a remote reservation is a workflow, not one request: commit the order as `pending` with an outbox row, dispatch `reserve` after commit with the order id as the idempotency key, and move the order to `confirmed` or `rejected` when the reply or event arrives. Retries, dead letters and the processed-events table are `nestjs-resilience`; writes go through `TransactionRunner` (`nestjs-typeorm` rule `orm-atomic-writes`).
 
 Reference: [NestJS Microservices](https://docs.nestjs.com/microservices/basics)
 
@@ -4544,249 +3762,223 @@ Reference: [NestJS Microservices](https://docs.nestjs.com/microservices/basics)
 
 **Impact: MEDIUM-HIGH** — Queues enable reliable background processing
 
-Use `@nestjs/bullmq` for background job processing. Queues decouple long-running tasks from HTTP requests, enable retry logic, and distribute workload across workers. Use them for emails, file processing, notifications, and any task that shouldn't block user requests.
+Move slow or failure-prone work (reports, mail, imports) out of the request into `@nestjs/bullmq`: the request enqueues and returns, a worker processes, and BullMQ re-runs failed attempts. This rule covers the BullMQ mechanics. What to retry, how often, and what happens to work that never succeeds is `nestjs-resilience`: queued work gets one retry layer (BullMQ's `attempts`/`backoff`, not a retrying policy inside `process()` as well), and the final failure becomes a durable dead letter (`dlq-record-final-failure`). BullMQ delivers at least once: a worker that dies mid-job leaves it stalled and another worker runs it again, so processors must be idempotent (`idempotency-processed-events`).
 
-**Incorrect (long-running tasks in HTTP handlers):**
+**Incorrect (work in the request; colon in a job id; final failure only logged; error text in fields; open board):**
 
 ```typescript
-// Long-running tasks in HTTP handlers
-@Controller('reports')
-export class ReportsController {
-  @Post()
-  async generate(@Body() dto: GenerateReportDto): Promise<Report> {
-    // This blocks the request for potentially minutes
-    const data = await this.fetchLargeDataset(dto);
-    const report = await this.processData(data); // Slow!
-    await this.sendEmail(dto.email, report); // Can fail!
-    return report; // Client times out
-  }
+@Post()
+async generate(@Body() dto: GenerateReportDto): Promise<Report> {
+  return this.reports.build(dto); // minutes inside the request; the client times out
 }
 
-// Fire-and-forget without retry
-@Injectable()
-export class EmailService {
-  async sendWelcome(email: string): Promise<void> {
-    // If this fails, email is never sent
-    await this.mailer.send({ to: email, template: 'welcome' });
-    // No retry, no tracking, no visibility
-  }
+await this.queue.add('send', { userId }, { jobId: `welcome:${userId}` }); // rejects: "Custom Id cannot contain :"
+
+@OnWorkerEvent('failed')
+onFailed(job: Job, error: Error) {
+  this.logger.warn('Job attempt failed', { jobId: job.id, error: error.message }); // message in fields, stack lost
+  // after the last attempt nothing is kept but the failed job, and removeOnFail: 5000 deletes it eventually
 }
 
-// Use setInterval for scheduled tasks
-setInterval(async () => {
-  await cleanupOldRecords();
-}, 60000); // No error handling, memory leaks
+BullBoardModule.forRoot({ route: '/admin/queues', adapter: ExpressAdapter }); // anyone can read payloads, retry and delete jobs
 ```
 
-**Correct (use BullMQ for background processing):**
+**Correct (`queues/queue.module.ts`):**
 
 ```typescript
-// Configure BullMQ
 import { BullModule } from '@nestjs/bullmq';
+import { Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { ReportsProcessor, ReportsService, WelcomeMailProcessor, WelcomeMailService } from './queues.js';
 
 @Module({
   imports: [
-    BullModule.forRoot({
-      connection: {
-        host: 'localhost',
-        port: 6379,
-      },
-      defaultJobOptions: {
-        removeOnComplete: 1000,
-        removeOnFail: 5000,
-        attempts: 3,
-        backoff: {
-          type: 'exponential',
-          delay: 1000,
+    BullModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        connection: { url: config.getOrThrow<string>('REDIS_URL') },
+        defaultJobOptions: {
+          // Attempts and backoff are the retry policy for queued work (nestjs-resilience); no second retry layer inside process()
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 1000 },
+          removeOnComplete: 1000,
+          removeOnFail: false, // a failed job is removed only once its dead letter is stored (ReportsProcessor.onFailed)
         },
-      },
+      }),
     }),
-    BullModule.registerQueue(
-      { name: 'email' },
-      { name: 'reports' },
-      { name: 'notifications' },
-    ),
+    BullModule.registerQueue({ name: 'reports' }, { name: 'welcome-mail' }),
   ],
+  providers: [ReportsService, ReportsProcessor, WelcomeMailService, WelcomeMailProcessor],
 })
 export class QueueModule {}
+```
 
-// Producer: Add jobs to queue
+**Correct (`queues/queues.ts`):**
+
+```typescript
+import { InjectQueue, OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Job, Queue, UnrecoverableError } from 'bullmq';
+import { DeadLetterStore } from '../dead-letter/dead-letter.store.js';
+import { ReportBuilder } from './report-builder.js';
+import { WelcomeMailer } from './welcome-mailer.js';
+
+export interface GenerateReport {
+  reportId: string;
+  ownerId: string;
+  urgent: boolean;
+}
+
+export interface ReportStatus {
+  state: string;
+  progress: Job['progress'];
+}
+
+const toError = (thrown: unknown): Error => (thrown instanceof Error ? thrown : new Error(String(thrown)));
+
 @Injectable()
 export class ReportsService {
-  constructor(
-    @InjectQueue('reports') private reportsQueue: Queue,
-  ) {}
+  constructor(@InjectQueue('reports') private readonly reports: Queue<GenerateReport>) {}
 
-  async requestReport(dto: GenerateReportDto): Promise<{ jobId: string }> {
-    // Return immediately, process in background
-    const job = await this.reportsQueue.add('generate', dto, {
-      priority: dto.urgent ? 1 : 10,
-      delay: dto.scheduledFor ? Date.parse(dto.scheduledFor) - Date.now() : 0,
-    });
-
-    return { jobId: job.id };
+  /** The report row exists already; its id is the job id, so a repeated request adds no second job. */
+  async requestReport(request: GenerateReport): Promise<{ jobId: string }> {
+    await this.reports.add('generate', request, { jobId: request.reportId, priority: request.urgent ? 1 : 10 });
+    return { jobId: request.reportId };
   }
 
-  async getJobStatus(jobId: string): Promise<JobStatus> {
-    const job = await this.reportsQueue.getJob(jobId);
-    return {
-      status: await job.getState(),
-      progress: job.progress,
-      result: job.returnvalue,
-    };
+  async status(jobId: string): Promise<ReportStatus> {
+    const job = await this.reports.getJob(jobId);
+    if (!job) throw new NotFoundException();
+    return { state: await job.getState(), progress: job.progress };
   }
 }
 
-// Consumer: Process jobs
 @Processor('reports')
-export class ReportsProcessor {
+export class ReportsProcessor extends WorkerHost {
   private readonly logger = new Logger(ReportsProcessor.name);
+  /** Final failures whose dead letter is stored: only these failed jobs may be removed. */
+  private readonly deadLettered = new Set<string>();
 
-  @Process('generate')
-  async generateReport(job: Job<GenerateReportDto>): Promise<Report> {
-    this.logger.log(`Processing report job ${job.id}`);
-
-    // Update progress
-    await job.updateProgress(10);
-
-    const data = await this.fetchData(job.data);
-    await job.updateProgress(50);
-
-    const report = await this.processData(data);
-    await job.updateProgress(90);
-
-    await this.saveReport(report);
-    await job.updateProgress(100);
-
-    return report;
+  constructor(
+    private readonly builder: ReportBuilder,
+    private readonly deadLetters: DeadLetterStore,
+  ) {
+    super();
   }
 
-  @OnQueueActive()
-  onActive(job: Job) {
-    this.logger.log(`Processing job ${job.id}`);
-  }
-
-  @OnQueueCompleted()
-  onCompleted(job: Job, result: any) {
-    this.logger.log(`Job ${job.id} completed`);
-  }
-
-  @OnQueueFailed()
-  onFailed(job: Job, error: Error) {
-    this.logger.error(`Job ${job.id} failed: ${error.message}`);
-  }
-}
-
-// Email queue with retry
-@Processor('email')
-export class EmailProcessor {
-  @Process('send')
-  async sendEmail(job: Job<SendEmailDto>): Promise<void> {
-    const { to, template, data } = job.data;
-
+  async process(job: Job<GenerateReport>): Promise<void> {
     try {
-      await this.mailer.send({
-        to,
-        template,
-        context: data,
-      });
+      await this.builder.build(job.data.reportId, (percent) => job.updateProgress(percent));
     } catch (error) {
-      // BullMQ will retry based on job options
-      throw error;
+      const err = toError(error);
+      // attemptsMade counts earlier failed attempts: this is the last one when it reaches attempts - 1
+      const final = err instanceof UnrecoverableError || job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
+      if (final && job.id) {
+        // A rejecting store fails the job with the store's error; the failed job stays as the only copy
+        await this.deadLetters.record({
+          key: `reports:${job.data.reportId}`,
+          attempts: job.attemptsMade + 1,
+          lastError: err.message,
+          failedAt: new Date(),
+          payload: job.data,
+        });
+        this.deadLettered.add(job.id);
+      }
+      throw err;
+    }
+  }
+
+  @OnWorkerEvent('failed')
+  async onFailed(job: Job<GenerateReport> | undefined, error: Error): Promise<void> {
+    const fields = { jobId: job?.id, attempt: job?.attemptsMade };
+    if (job && job.finishedOn === undefined) {
+      this.logger.warn('Report job attempt failed, will retry', fields, error);
+      return;
+    }
+    this.logger.error('Report job failed', fields, error);
+    if (!job?.id || !this.deadLettered.delete(job.id)) return; // no dead letter: keep the failed job
+    try {
+      await job.remove();
+    } catch (removeError) {
+      this.logger.warn('Dead-lettered job not removed', fields, toError(removeError));
     }
   }
 }
 
-// Usage
+/** Payload holds ids, not personal data: job data is visible in Redis and in Bull Board. */
+export interface SendWelcome {
+  userId: string;
+}
+
 @Injectable()
-export class NotificationService {
-  constructor(@InjectQueue('email') private emailQueue: Queue) {}
+export class WelcomeMailService {
+  constructor(@InjectQueue('welcome-mail') private readonly queue: Queue<SendWelcome>) {}
 
-  async sendWelcome(user: User): Promise<void> {
-    await this.emailQueue.add(
-      'send',
-      {
-        to: user.email,
-        template: 'welcome',
-        data: { name: user.name },
-      },
-      {
-        attempts: 5,
-        backoff: { type: 'exponential', delay: 5000 },
-      },
-    );
+  /** Custom job ids must not contain ':' (BullMQ rejects them); a repeated enqueue for the same user adds no second job. */
+  async enqueue(userId: string): Promise<void> {
+    await this.queue.add('send', { userId }, { jobId: `welcome-${userId}`, attempts: 5, backoff: { type: 'exponential', delay: 5000 } });
   }
 }
 
-// Scheduled jobs
-@Injectable()
-export class ScheduledJobsService implements OnModuleInit {
-  constructor(@InjectQueue('maintenance') private queue: Queue) {}
+@Processor('welcome-mail')
+export class WelcomeMailProcessor extends WorkerHost {
+  constructor(private readonly mailer: WelcomeMailer) {
+    super();
+  }
 
-  async onModuleInit(): Promise<void> {
-    // Clean up old reports daily at midnight
-    await this.queue.add(
-      'cleanup',
-      {},
-      {
-        repeat: { cron: '0 0 * * *' },
-        jobId: 'daily-cleanup', // Prevent duplicates
-      },
-    );
-
-    // Send digest every hour
-    await this.queue.add(
-      'digest',
-      {},
-      {
-        repeat: { every: 60 * 60 * 1000 },
-        jobId: 'hourly-digest',
-      },
-    );
+  /** At-least-once: a stalled job runs again, so send() must skip users it already mailed. */
+  async process(job: Job<SendWelcome>): Promise<void> {
+    await this.mailer.send(job.data.userId);
   }
 }
+```
 
-@Processor('maintenance')
-export class MaintenanceProcessor {
-  @Process('cleanup')
-  async cleanup(): Promise<void> {
-    await this.cleanupOldReports();
-    await this.cleanupExpiredSessions();
-  }
+**Correct (`queues/queue-board.module.ts`, never public):**
 
-  @Process('digest')
-  async sendDigest(): Promise<void> {
-    const users = await this.getUsersForDigest();
-    for (const user of users) {
-      await this.emailQueue.add('send', { to: user.email, template: 'digest' });
-    }
-  }
-}
-
-// Queue monitoring with Bull Board
-import { BullBoardModule } from '@bull-board/nestjs';
+```typescript
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter';
+import { ExpressAdapter } from '@bull-board/express';
+import { BullBoardModule } from '@bull-board/nestjs';
+import { Injectable, Module, type NestMiddleware } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import type { NextFunction, Request, Response } from 'express';
+
+/** Fixed-length digests: the comparison takes the same time whatever the header's length. */
+const digest = (value: string): Buffer => createHash('sha256').update(value).digest();
+
+/** Basic auth for the board; behind SSO or a reverse-proxy policy, check that identity here instead. */
+@Injectable()
+export class QueueBoardAuth implements NestMiddleware {
+  private readonly expected: Buffer;
+
+  constructor(config: ConfigService) {
+    const credentials = `${config.getOrThrow<string>('QUEUE_BOARD_USER')}:${config.getOrThrow<string>('QUEUE_BOARD_PASSWORD')}`;
+    this.expected = digest(`Basic ${Buffer.from(credentials).toString('base64')}`);
+  }
+
+  use(req: Request, res: Response, next: NextFunction): void {
+    if (timingSafeEqual(digest(req.headers.authorization ?? ''), this.expected)) return next();
+    res.setHeader('WWW-Authenticate', 'Basic realm="queues"').status(401).end();
+  }
+}
 
 @Module({
   imports: [
-    BullBoardModule.forRoot({
-      route: '/admin/queues',
-      adapter: ExpressAdapter,
-    }),
-    BullBoardModule.forFeature({
-      name: 'email',
-      adapter: BullMQAdapter,
-    }),
-    BullBoardModule.forFeature({
-      name: 'reports',
-      adapter: BullMQAdapter,
-    }),
+    BullBoardModule.forRoot({ route: '/admin/queues', adapter: ExpressAdapter, middleware: QueueBoardAuth }),
+    BullBoardModule.forFeature({ name: 'reports', adapter: BullMQAdapter }, { name: 'welcome-mail', adapter: BullMQAdapter }),
   ],
 })
-export class AdminModule {}
+export class QueueBoardModule {}
 ```
 
-Reference: [NestJS Queues](https://docs.nestjs.com/techniques/queues)
+Probe results (Redis 8.10.2, `bullmq` 6.5.1, `@nestjs/bullmq` 12.0.0, `@bull-board/*` 9.10.5): `jobId: 'welcome:u1'` rejected with `Custom Id cannot contain :`; `welcome-u1` was accepted and processed. Requesting a report twice left one job. A builder that always threw ran 3 times and logged `warn` `Report job attempt failed, will retry` for attempts 1 and 2, then `error` `Report job failed` `{ jobId, attempt: 3 }` with `Error('boom 3')`; the store held one dead letter `{"key":"reports:r2","attempts":3,"lastError":"boom 3"}` and the failed job was gone. With a store whose `record()` threw `dead-letter table locked`, the job stayed in state `failed` with that `failedReason` and no dead letter existed. An `UnrecoverableError` failed after one attempt with one dead letter and one `error` log. The board answered 401 without credentials, with a wrong password and with a longer header, and 200 with the right ones (UI and `/admin/queues/api/queues`). `DeadLetterStore` is the injectable store from `nestjs-resilience`; back it with a migrated table so dead letters survive Redis eviction. If the process dies between `record()` and `job.remove()`, both copies remain, never neither.
+
+Bull Board shows every job's payload and can retry, promote and delete jobs: put it behind your admin authentication (or a reverse-proxy policy) and never route it publicly. Keep personal data out of payloads (ids, not email addresses); Redis and the board keep job data until removal.
+
+`@nestjs/bullmq` consumers extend `WorkerHost` and implement one `process(job)` per queue, dispatching on `job.name` when a queue carries several job types; `@Process()` belongs to the older `@nestjs/bull`. Repeating jobs are job schedulers upserted by id (`queue.upsertJobScheduler('daily-cleanup', { pattern: '0 0 * * *' }, { name: 'cleanup' })`), which stays one scheduler per id across restarts and instances; `RepeatOptions` has `pattern`, not `cron`. Every queue a producer or consumer uses must be registered with `BullModule.registerQueue`. A producer that must not delay the response doesn't leave `enqueue()` unawaited: it calls a `dispatch(): void` that tracks the promise for `drain()` and ends it in a terminal `.catch` (`nestjs-resilience` rule `dlq-record-final-failure`). Workers close at shutdown: `devops-graceful-shutdown`. Log levels and call shape: `nestjs-logging`.
+
+Reference: [NestJS Queues](https://docs.nestjs.com/techniques/queues), [BullMQ Retrying failing jobs](https://docs.bullmq.io/guide/retrying-failing-jobs)
 
 ---
 
@@ -4798,219 +3990,65 @@ Reference: [NestJS Queues](https://docs.nestjs.com/techniques/queues)
 
 **Impact: MEDIUM-HIGH** — Proper shutdown handling ensures zero-downtime deployments
 
-Handle SIGTERM and SIGINT signals to gracefully shutdown your NestJS application. Stop accepting new requests, wait for in-flight requests to complete, close database connections, and clean up resources. This prevents data loss and connection errors during deployments.
+On `SIGTERM` the instance must stop receiving new traffic, finish what is in flight, then release resources, in that order. One owner handles the signal: `app.enableShutdownHooks()` in `main.ts`. A second `process.on('SIGTERM')` handler that calls `server.close()` / `app.close()` / `process.exit()` races Nest's own sequence and can exit while hooks still run. Nest's sequence on a signal is `onModuleDestroy` → `beforeApplicationShutdown` → close the HTTP server (waits for in-flight requests) → `onApplicationShutdown` → re-raise the signal. The load balancer only stops routing after readiness fails, so readiness has to fail first and the HTTP server must keep serving for a bounded drain period: that is `beforeApplicationShutdown`.
 
-**Incorrect (ignoring shutdown signals):**
-
-```typescript
-// Ignore shutdown signals
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-  await app.listen(3000);
-  // App crashes immediately on SIGTERM
-  // In-flight requests fail
-  // Database connections are abruptly closed
-}
-
-// Long-running tasks without cancellation
-@Injectable()
-export class ProcessingService {
-  async processLargeFile(file: File): Promise<void> {
-    // No way to interrupt this during shutdown
-    for (let i = 0; i < file.chunks.length; i++) {
-      await this.processChunk(file.chunks[i]);
-      // May run for minutes, blocking shutdown
-    }
-  }
-}
-```
-
-**Correct (enable shutdown hooks and handle cleanup):**
+**Incorrect (own signal handler; readiness flipped during teardown; hand-closed connections):**
 
 ```typescript
-// Enable shutdown hooks in main.ts
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
-
-  // Enable shutdown hooks
-  app.enableShutdownHooks();
-
-  // Optional: Add timeout for forced shutdown
-  const server = await app.listen(3000);
-  server.setTimeout(30000); // 30 second timeout
-
-  // Handle graceful shutdown
-  const signals = ['SIGTERM', 'SIGINT'];
-  signals.forEach((signal) => {
-    process.on(signal, async () => {
-      console.log(`Received ${signal}, starting graceful shutdown...`);
-
-      // Stop accepting new connections
-      server.close(async () => {
-        console.log('HTTP server closed');
-        await app.close();
-        process.exit(0);
-      });
-
-      // Force exit after timeout
-      setTimeout(() => {
-        console.error('Forced shutdown after timeout');
-        process.exit(1);
-      }, 30000);
-    });
+process.on('SIGTERM', () => {
+  server.close(async () => {
+    await app.close();
+    process.exit(0); // a second shutdown path next to enableShutdownHooks()
   });
-}
+});
 
-// Lifecycle hooks for cleanup
-@Injectable()
-export class DatabaseService implements OnApplicationShutdown {
-  private readonly connections: Connection[] = [];
-
-  async onApplicationShutdown(signal?: string): Promise<void> {
-    console.log(`Database service shutting down on ${signal}`);
-
-    // Close all connections gracefully
-    await Promise.all(
-      this.connections.map((conn) => conn.close()),
-    );
-
-    console.log('All database connections closed');
-  }
-}
-
-// Queue processor with graceful shutdown
-@Injectable()
-export class QueueService implements OnApplicationShutdown, OnModuleDestroy {
-  private isShuttingDown = false;
-
-  onModuleDestroy(): void {
-    this.isShuttingDown = true;
-  }
-
-  async onApplicationShutdown(): Promise<void> {
-    // Wait for current jobs to complete
-    await this.queue.close();
-  }
-
-  async processJob(job: Job): Promise<void> {
-    if (this.isShuttingDown) {
-      throw new Error('Service is shutting down');
-    }
-    await this.doWork(job);
-  }
-}
-
-// WebSocket gateway cleanup
-@WebSocketGateway()
-export class EventsGateway implements OnApplicationShutdown {
-  @WebSocketServer()
-  server: Server;
-
-  async onApplicationShutdown(): Promise<void> {
-    // Notify all connected clients
-    this.server.emit('shutdown', { message: 'Server is shutting down' });
-
-    // Close all connections
-    this.server.disconnectSockets();
-  }
-}
-
-// Health check integration
-@Injectable()
-export class ShutdownService {
-  private isShuttingDown = false;
-
-  startShutdown(): void {
-    this.isShuttingDown = true;
-  }
-
-  isShutdown(): boolean {
-    return this.isShuttingDown;
-  }
-}
-
-@Controller('health')
-export class HealthController {
-  constructor(private shutdownService: ShutdownService) {}
-
-  @Get('ready')
-  @HealthCheck()
-  readiness(): Promise<HealthCheckResult> {
-    // Return 503 during shutdown - k8s stops sending traffic
-    if (this.shutdownService.isShutdown()) {
-      throw new ServiceUnavailableException('Shutting down');
-    }
-
-    return this.health.check([
-      () => this.db.pingCheck('database'),
-    ]);
-  }
-}
-
-// Integrate with shutdown
 @Injectable()
 export class AppShutdownService implements OnApplicationShutdown {
-  constructor(private shutdownService: ShutdownService) {}
-
   async onApplicationShutdown(): Promise<void> {
-    // Mark as unhealthy first
-    this.shutdownService.startShutdown();
-
-    // Wait for k8s to update endpoints
-    await this.sleep(5000);
-
-    // Then proceed with cleanup
+    this.shutdownService.startShutdown(); // the HTTP server is already closed: too late to drain
+    await sleep(5000);
   }
 }
 
-// Request tracking for in-flight requests
 @Injectable()
-export class RequestTracker implements NestMiddleware, OnApplicationShutdown {
-  private activeRequests = 0;
-  private isShuttingDown = false;
-  private shutdownPromise: Promise<void> | null = null;
-  private resolveShutdown: (() => void) | null = null;
-
-  use(req: Request, res: Response, next: NextFunction): void {
-    if (this.isShuttingDown) {
-      res.status(503).send('Service Unavailable');
-      return;
-    }
-
-    this.activeRequests++;
-
-    res.on('finish', () => {
-      this.activeRequests--;
-      if (this.isShuttingDown && this.activeRequests === 0 && this.resolveShutdown) {
-        this.resolveShutdown();
-      }
-    });
-
-    next();
-  }
-
-  async onApplicationShutdown(): Promise<void> {
-    this.isShuttingDown = true;
-
-    if (this.activeRequests > 0) {
-      console.log(`Waiting for ${this.activeRequests} requests to complete`);
-      this.shutdownPromise = new Promise((resolve) => {
-        this.resolveShutdown = resolve;
-      });
-
-      // Wait with timeout
-      await Promise.race([
-        this.shutdownPromise,
-        new Promise((resolve) => setTimeout(resolve, 30000)),
-      ]);
-    }
-
-    console.log('All requests completed');
-  }
+export class DatabaseService implements OnApplicationShutdown {
+  private readonly connections: Connection[] = []; // TypeORM 1.x has no Connection; @nestjs/typeorm owns the DataSource
 }
 ```
 
-Reference: [NestJS Lifecycle Events](https://docs.nestjs.com/fundamentals/lifecycle-events)
+**Correct (`src/main.ts`, the shutdown line; the whole file is `nestjs-logging` rule `setup-json-console-logger`):**
+
+```typescript
+const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger });
+configureApp(app);
+app.enableShutdownHooks(); // the only SIGTERM/SIGINT listener: runs the shutdown hooks, then re-raises the signal
+await app.listen(process.env.PORT ?? 3000);
+```
+
+**Correct (readiness fails, then a bounded drain; `health/health.module.ts` from `micro-use-health-checks`):**
+
+```typescript
+TerminusModule.forRootAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService<Env, true>) => ({
+    // On SIGTERM: every health check answers 503 "shutting_down", then shutdown waits this long
+    gracefulShutdownTimeoutMs: config.get('SHUTDOWN_DRAIN_MS', { infer: true }), // validated integer >= 0, default 10000
+  }),
+}),
+```
+
+`@nestjs/terminus` 12.1.0 does both steps in its own `beforeApplicationShutdown`: it marks every health check `shutting_down` (503) and, on `SIGTERM` only, waits `gracefulShutdownTimeoutMs`. `app.close()` in tests skips the wait. In the probe (built app, `SHUTDOWN_DRAIN_MS=1500`), a 2.5 s request was started, then `SIGTERM` sent: `/health/ready` answered `503 {"status":"shutting_down",…}` 0.3 s later while normal routes still answered, the log showed `Awaiting 1500ms before shutdown`, the slow request completed with `200 {"done":true}` 2.30 s after the signal, and the process then exited with code 143 (the re-raised `SIGTERM`). `SHUTDOWN_DRAIN_MS` comes from the validated `Env` (`devops-use-config-module`), so a non-integer or negative value stops startup instead of reaching Terminus as `NaN`. Set the drain longer than the readiness probe's `periodSeconds × failureThreshold`, and `terminationGracePeriodSeconds` longer than the drain plus the slowest request; Kubernetes sends `SIGKILL` when it runs out.
+
+Nest runs `beforeApplicationShutdown` module by module and awaits each: in the probe, a hook in `AppModule` ran before Terminus's. A hook that awaits long work there delays the readiness flip, so keep those hooks short or bounded.
+
+What each resource does at shutdown, and who owns it:
+- **Database:** `@nestjs/typeorm` destroys its `DataSource` in `onApplicationShutdown`; don't close it yourself (`nestjs-typeorm`).
+- **Clients you create** (Redis, brokers): close them in `onApplicationShutdown`, after the HTTP server has stopped (`perf-async-hooks`); closing in `onModuleDestroy` breaks requests that are still draining.
+- **Scheduled jobs:** await the running job in `beforeApplicationShutdown` (`nestjs-schedule` rule `lifecycle-drain-on-shutdown`).
+- **BullMQ workers:** `@nestjs/bullmq` 12.0.0 calls `worker.close()` in `onApplicationShutdown`, which waits for active jobs; a job cut off by `SIGKILL` is picked up again as stalled, so processors must be idempotent (`micro-use-queues`).
+- **Process handlers** (`uncaughtException`, `unhandledRejection`) log `fatal` and exit non-zero: `error-handle-async-errors`.
+
+Reference: [NestJS Lifecycle Events](https://docs.nestjs.com/fundamentals/lifecycle-events), [NestJS Terminus](https://docs.nestjs.com/recipes/terminus)
 
 ---
 
@@ -5018,394 +4056,121 @@ Reference: [NestJS Lifecycle Events](https://docs.nestjs.com/fundamentals/lifecy
 
 **Impact: LOW-MEDIUM** — Proper configuration prevents deployment failures
 
-Use `@nestjs/config` for environment-based configuration. Validate configuration at startup to fail fast on misconfigurations. Use namespaced configuration for organization and type safety.
+Read configuration through `@nestjs/config`, validate every variable once at startup, and give consumers typed access that cannot return `undefined`. Scattered `process.env` reads fail late (`parseInt(undefined)` is `NaN`, a typo is `undefined`) and differ between services. An untyped `ConfigService.get<number>('app.port')` is `number | undefined` under `strict`, so returning it as `number` does not compile, and casting it away moves the failure to runtime. Database settings are not part of this rule: TypeORM reads them in the one `src/data-source.ts` shared by the CLI and `forRootAsync` (`nestjs-typeorm` rule `orm-single-data-source`); a second inline `TypeOrmModule.forRootAsync({ type: 'postgres', … })` here would drift from what migrations run against.
 
-**Incorrect (accessing process.env directly):**
+**Incorrect (direct env access; untyped getters):**
 
 ```typescript
-// Access process.env directly
 @Injectable()
-export class DatabaseService {
-  constructor() {
-    // No validation, can fail at runtime
-    this.connection = new Pool({
-      host: process.env.DB_HOST,
-      port: parseInt(process.env.DB_PORT), // NaN if missing
-      password: process.env.DB_PASSWORD, // undefined if missing
-    });
-  }
+export class MailService {
+  private readonly apiKey = process.env.MAIL_API_KEY || 'default'; // a typo or a missing variable goes unnoticed
 }
 
-// Scattered env access
 @Injectable()
-export class EmailService {
-  sendEmail() {
-    // Different services access env differently
-    const apiKey = process.env.SENDGRID_API_KEY || 'default';
-    // Typos go unnoticed: process.env.SENDGRID_API_KY
+export class AppService {
+  constructor(private readonly config: ConfigService) {}
+
+  getPort(): number {
+    return this.config.get<number>('app.port'); // TS2322: Type 'number | undefined' is not assignable to type 'number'
   }
 }
 ```
 
-**Correct (use @nestjs/config with validation):**
+**Correct (`config/env.validation.ts`):**
 
 ```typescript
-// Setup validated configuration
-import { ConfigModule, ConfigService, registerAs } from '@nestjs/config';
-import * as Joi from 'joi';
+import Joi from 'joi';
 
-// config/database.config.ts
-export const databaseConfig = registerAs('database', () => ({
-  host: process.env.DB_HOST,
-  port: parseInt(process.env.DB_PORT, 10),
-  username: process.env.DB_USERNAME,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-}));
+/** Every variable the app reads, as the validated (converted, defaulted) values. */
+export interface Env {
+  NODE_ENV: 'development' | 'production' | 'test';
+  PORT: number;
+  REDIS_URL: string;
+  JWT_SECRET: string;
+  MAIL_API_KEY: string;
+  MAIL_FROM: string;
+  SHUTDOWN_DRAIN_MS: number;
+}
 
-// config/app.config.ts
-export const appConfig = registerAs('app', () => ({
-  port: parseInt(process.env.PORT, 10) || 3000,
-  environment: process.env.NODE_ENV || 'development',
-  apiPrefix: process.env.API_PREFIX || 'api',
-}));
-
-// config/validation.schema.ts
-export const validationSchema = Joi.object({
-  NODE_ENV: Joi.string()
-    .valid('development', 'production', 'test')
-    .default('development'),
-  PORT: Joi.number().default(3000),
-  DB_HOST: Joi.string().required(),
-  DB_PORT: Joi.number().default(5432),
-  DB_USERNAME: Joi.string().required(),
-  DB_PASSWORD: Joi.string().required(),
-  DB_NAME: Joi.string().required(),
+export const envSchema = Joi.object<Env, true>({
+  NODE_ENV: Joi.string().valid('development', 'production', 'test').default('development'),
+  PORT: Joi.number().port().default(3000),
+  REDIS_URL: Joi.string().uri({ scheme: ['redis', 'rediss'] }).required(),
   JWT_SECRET: Joi.string().min(32).required(),
-  REDIS_URL: Joi.string().uri().required(),
+  MAIL_API_KEY: Joi.string().required(),
+  MAIL_FROM: Joi.string().email().required(),
+  SHUTDOWN_DRAIN_MS: Joi.number().integer().min(0).default(10_000), // micro-use-health-checks
 });
+```
 
-// app.module.ts
+**Correct (`config/mail.config.ts`):**
+
+```typescript
+import { registerAs } from '@nestjs/config';
+
+/** Namespaced settings for one feature; runs after validation, so the variables are present. */
+export const mailConfig = registerAs('mail', () => ({
+  apiKey: process.env.MAIL_API_KEY ?? '',
+  from: process.env.MAIL_FROM ?? '',
+}));
+```
+
+**Correct (`app.module.ts`):**
+
+```typescript
+import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { envSchema } from './config/env.validation.js';
+import { mailConfig } from './config/mail.config.js';
+
 @Module({
   imports: [
     ConfigModule.forRoot({
-      isGlobal: true, // Available everywhere without importing
-      load: [databaseConfig, appConfig],
-      validationSchema,
-      validationOptions: {
-        abortEarly: true, // Stop on first error
-        allowUnknown: true, // Allow other env vars
-      },
-    }),
-    TypeOrmModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        type: 'postgres',
-        host: config.get('database.host'),
-        port: config.get('database.port'),
-        username: config.get('database.username'),
-        password: config.get('database.password'),
-        database: config.get('database.database'),
-        autoLoadEntities: true,
-      }),
+      isGlobal: true,
+      cache: true,
+      load: [mailConfig],
+      validationSchema: envSchema,
     }),
   ],
 })
 export class AppModule {}
-
-// Type-safe configuration access
-export interface AppConfig {
-  port: number;
-  environment: 'development' | 'production' | 'test';
-  apiPrefix: string;
-}
-
-export interface DatabaseConfig {
-  host: string;
-  port: number;
-  username: string;
-  password: string;
-  database: string;
-}
-
-// Type-safe access
-@Injectable()
-export class AppService {
-  constructor(private config: ConfigService) {}
-
-  getPort(): number {
-    // Type-safe with generic
-    return this.config.get<number>('app.port');
-  }
-
-  getDatabaseConfig(): DatabaseConfig {
-    return this.config.get<DatabaseConfig>('database');
-  }
-}
-
-// Inject namespaced config directly
-@Injectable()
-export class DatabaseService {
-  constructor(
-    @Inject(databaseConfig.KEY)
-    private dbConfig: ConfigType<typeof databaseConfig>,
-  ) {
-    // Full type inference!
-    const host = this.dbConfig.host; // string
-    const port = this.dbConfig.port; // number
-  }
-}
-
-// Environment files support
-ConfigModule.forRoot({
-  envFilePath: [
-    `.env.${process.env.NODE_ENV}.local`,
-    `.env.${process.env.NODE_ENV}`,
-    '.env.local',
-    '.env',
-  ],
-});
-
-// .env.development
-// DB_HOST=localhost
-// DB_PORT=5432
-
-// .env.production
-// DB_HOST=prod-db.example.com
-// DB_PORT=5432
 ```
+
+**Correct (typed access):**
+
+```typescript
+import { Inject, Injectable } from '@nestjs/common';
+import { ConfigService, type ConfigType } from '@nestjs/config';
+import type { Env } from '../config/env.validation.js';
+import { mailConfig } from '../config/mail.config.js';
+
+@Injectable()
+export class TokenService {
+  // `true`: the schema guarantees every key, so get() returns Env[K], never undefined
+  constructor(private readonly config: ConfigService<Env, true>) {}
+
+  secret(): string {
+    return this.config.get('JWT_SECRET', { infer: true });
+  }
+
+  port(): number {
+    return this.config.get('PORT', { infer: true });
+  }
+}
+
+@Injectable()
+export class MailService {
+  constructor(@Inject(mailConfig.KEY) private readonly mail: ConfigType<typeof mailConfig>) {}
+
+  sender(): string {
+    return this.mail.from;
+  }
+}
+```
+
+`@nestjs/config` 12.0.1 validates `validationSchema` through Standard Schema and defaults Joi to `abortEarly: false, allowUnknown: true`, so one start reports every problem; Joi 18.3.1 implements the interface. `ConfigModule.forRoot()` is async and runs when `AppModule` is imported, so `main.ts` fails before `NestFactory.create` resolves. With four bad variables the probe failed with `Config validation error: REDIS_URL: "REDIS_URL" must be a valid uri with a scheme matching the redis|rediss pattern` followed by one line each for `JWT_SECRET` (too short), `MAIL_API_KEY` and `MAIL_FROM` (required). With valid values and no `PORT`, `config.get('PORT', { infer: true })` returned the number `3000` (the validated, converted value; `process.env.PORT` stays a string), and the injected `mailConfig` returned `noreply@example.com`. The `?? ''` in `mailConfig` only satisfies the compiler; validation has already guaranteed both variables. Secrets come from the environment or a secret store, never from committed `.env` files.
 
 Reference: [NestJS Configuration](https://docs.nestjs.com/techniques/configuration)
-
----
-
-### 9.3 Use Structured Logging
-
-**Impact: MEDIUM-HIGH** — Structured logging enables effective debugging and monitoring
-
-Use NestJS Logger with structured JSON output in production. Include contextual information (request ID, user ID, operation) to trace requests across services. Avoid console.log and implement proper log levels.
-
-**Incorrect (using console.log in production):**
-
-```typescript
-// Use console.log in production
-@Injectable()
-export class UsersService {
-  async createUser(dto: CreateUserDto): Promise<User> {
-    console.log('Creating user:', dto);
-    // Not structured, no levels, lost in production logs
-
-    try {
-      const user = await this.repo.save(dto);
-      console.log('User created:', user.id);
-      return user;
-    } catch (error) {
-      console.log('Error:', error); // Using log for errors
-      throw error;
-    }
-  }
-}
-
-// Log sensitive data
-console.log('Login attempt:', { email, password }); // SECURITY RISK!
-
-// Inconsistent log format
-logger.log('User ' + userId + ' created at ' + new Date());
-// Hard to parse, no structure
-```
-
-**Correct (use structured logging with context):**
-
-```typescript
-// Configure logger in main.ts
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule, {
-    logger:
-      process.env.NODE_ENV === 'production'
-        ? ['error', 'warn', 'log']
-        : ['error', 'warn', 'log', 'debug', 'verbose'],
-  });
-}
-
-// Use NestJS Logger with context
-@Injectable()
-export class UsersService {
-  private readonly logger = new Logger(UsersService.name);
-
-  async createUser(dto: CreateUserDto): Promise<User> {
-    this.logger.log('Creating user', { email: dto.email });
-
-    try {
-      const user = await this.repo.save(dto);
-      this.logger.log('User created', { userId: user.id });
-      return user;
-    } catch (error) {
-      this.logger.error('Failed to create user', error.stack, {
-        email: dto.email,
-      });
-      throw error;
-    }
-  }
-}
-
-// Custom logger for JSON output
-@Injectable()
-export class JsonLogger implements LoggerService {
-  log(message: string, context?: object): void {
-    console.log(
-      JSON.stringify({
-        level: 'info',
-        timestamp: new Date().toISOString(),
-        message,
-        ...context,
-      }),
-    );
-  }
-
-  error(message: string, trace?: string, context?: object): void {
-    console.error(
-      JSON.stringify({
-        level: 'error',
-        timestamp: new Date().toISOString(),
-        message,
-        trace,
-        ...context,
-      }),
-    );
-  }
-
-  warn(message: string, context?: object): void {
-    console.warn(
-      JSON.stringify({
-        level: 'warn',
-        timestamp: new Date().toISOString(),
-        message,
-        ...context,
-      }),
-    );
-  }
-
-  debug(message: string, context?: object): void {
-    console.debug(
-      JSON.stringify({
-        level: 'debug',
-        timestamp: new Date().toISOString(),
-        message,
-        ...context,
-      }),
-    );
-  }
-}
-
-// Request context logging with ClsModule
-import { ClsModule, ClsService } from 'nestjs-cls';
-
-@Module({
-  imports: [
-    ClsModule.forRoot({
-      global: true,
-      middleware: {
-        mount: true,
-        generateId: true,
-      },
-    }),
-  ],
-})
-export class AppModule {}
-
-// Middleware to set request context
-@Injectable()
-export class RequestContextMiddleware implements NestMiddleware {
-  constructor(private cls: ClsService) {}
-
-  use(req: Request, res: Response, next: NextFunction): void {
-    const requestId = req.headers['x-request-id'] || randomUUID();
-    this.cls.set('requestId', requestId);
-    this.cls.set('userId', req.user?.id);
-
-    res.setHeader('x-request-id', requestId);
-    next();
-  }
-}
-
-// Logger that includes request context
-@Injectable()
-export class ContextLogger {
-  constructor(private cls: ClsService) {}
-
-  log(message: string, data?: object): void {
-    console.log(
-      JSON.stringify({
-        level: 'info',
-        timestamp: new Date().toISOString(),
-        requestId: this.cls.get('requestId'),
-        userId: this.cls.get('userId'),
-        message,
-        ...data,
-      }),
-    );
-  }
-
-  error(message: string, error: Error, data?: object): void {
-    console.error(
-      JSON.stringify({
-        level: 'error',
-        timestamp: new Date().toISOString(),
-        requestId: this.cls.get('requestId'),
-        userId: this.cls.get('userId'),
-        message,
-        error: error.message,
-        stack: error.stack,
-        ...data,
-      }),
-    );
-  }
-}
-
-// Pino integration for high-performance logging
-import { LoggerModule } from 'nestjs-pino';
-
-@Module({
-  imports: [
-    LoggerModule.forRoot({
-      pinoHttp: {
-        level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
-        transport:
-          process.env.NODE_ENV !== 'production'
-            ? { target: 'pino-pretty' }
-            : undefined,
-        redact: ['req.headers.authorization', 'req.body.password'],
-        serializers: {
-          req: (req) => ({
-            method: req.method,
-            url: req.url,
-            query: req.query,
-          }),
-          res: (res) => ({
-            statusCode: res.statusCode,
-          }),
-        },
-      },
-    }),
-  ],
-})
-export class AppModule {}
-
-// Usage with Pino
-@Injectable()
-export class UsersService {
-  constructor(private logger: PinoLogger) {
-    this.logger.setContext(UsersService.name);
-  }
-
-  async findOne(id: string): Promise<User> {
-    this.logger.info({ userId: id }, 'Finding user');
-    // Pino uses first arg for data, second for message
-  }
-}
-```
-
-Reference: [NestJS Logger](https://docs.nestjs.com/techniques/logger)
 
 ---
 
@@ -5419,4 +4184,4 @@ Reference: [NestJS Logger](https://docs.nestjs.com/techniques/logger)
 
 ---
 
-*Generated by build-agents.ts on 2026-10-29*
+*Generated by build-agents.ts on 2026-10-30*

@@ -48,8 +48,8 @@ async applyStatusEvent(event: OrderStatusEvent): Promise<{ status: 'processed' |
     if (isUniqueViolation(error)) return { status: 'duplicate' };
     throw error;
   }
-  // Committed. The contract answers without waiting for the carrier; push() records its own failures.
-  void this.orderSync.push({ id: order.id, status: order.status });
+  // Committed. The contract answers without waiting for the carrier; dispatch() owns every failure.
+  this.orderSync.dispatch({ id: order.id, status: order.status });
   return { status: 'processed' };
 }
 ```

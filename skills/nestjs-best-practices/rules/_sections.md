@@ -33,7 +33,7 @@ The section ID (in parentheses) is the filename prefix used to group rules.
 ## 6. Database & ORM (db)
 
 **Impact:** MEDIUM-HIGH
-**Description:** Proper database access patterns, transactions, and query optimization are crucial for data-intensive applications.
+**Description:** Query patterns that avoid N+1 queries and over-fetching. Transactions, migrations and the data source are owned by `nestjs-typeorm`.
 
 ## 7. API Design (api)
 
@@ -48,4 +48,4 @@ The section ID (in parentheses) is the filename prefix used to group rules.
 ## 9. DevOps & Deployment (devops)
 
 **Impact:** LOW-MEDIUM
-**Description:** Configuration management, structured logging, and graceful shutdown ensure production readiness and zero-downtime deployments.
+**Description:** Configuration management and graceful shutdown ensure production readiness and zero-downtime deployments.

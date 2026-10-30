@@ -7,185 +7,147 @@ tags: api, versioning, breaking-changes, compatibility
 
 ## Use API Versioning for Breaking Changes
 
-Use NestJS built-in versioning when making breaking changes to your API. Choose a versioning strategy (URI, header, or media type) and apply it consistently. This allows old clients to continue working while new clients use updated endpoints.
+Use Nest's built-in versioning when a response or request contract changes incompatibly. Pick one strategy (URI, header or media type) for the whole API and enable it once in `configureApp()`, so production and every e2e app route the same way. Let the router select the handler with `version` / `@Version()`; each version's controller returns its own typed DTO, and the service underneath stays version-neutral. Version branching inside a service (`findOne(id, version): Promise<any>`) bypasses the router, accepts versions nobody supports, and hides each version's contract.
 
-**Incorrect (breaking changes without versioning):**
+**Incorrect (breaking change in place; version selected by hand):**
 
 ```typescript
-// Breaking changes without versioning
-@Controller('users')
-export class UsersController {
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<User> {
-    // Original response: { id, name, email }
-    // Later changed to: { id, firstName, lastName, emailAddress }
-    // Old clients break!
-    return this.usersService.findOne(id);
-  }
+@Get(':id')
+findOne(@Param('id') id: string): Promise<User> {
+  // v1 clients expected { id, name, email }; now { id, firstName, lastName, emailAddress }
+  return this.usersService.findOne(id);
 }
 
-// Manual versioning in routes
-@Controller('v1/users')
-export class UsersV1Controller {}
-
-@Controller('v2/users')
-export class UsersV2Controller {}
-// Inconsistent, error-prone, hard to maintain
+@Get(':id')
+findOne(@Param('id') id: string, @Headers('X-API-Version') version = '1'): Promise<any> {
+  return this.usersService.findOne(id, version); // any version string reaches the service
+}
 ```
 
-**Correct (use NestJS built-in versioning):**
+**Correct (`src/configure-app.ts`):**
 
 ```typescript
-// Enable versioning in main.ts
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+import { VersioningType } from '@nestjs/common';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 
-  // URI versioning: /v1/users, /v2/users
-  app.enableVersioning({
-    type: VersioningType.URI,
-    defaultVersion: '1',
-  });
+/** Settings production and tests share; main.ts and createTestApp call this. */
+export function configureApp(app: NestExpressApplication): NestExpressApplication {
+  return app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' }); // /v1/users, /v2/users
+}
+```
 
-  // Or header versioning: X-API-Version: 1
-  app.enableVersioning({
-    type: VersioningType.HEADER,
-    header: 'X-API-Version',
-    defaultVersion: '1',
-  });
+Header (`{ type: VersioningType.HEADER, header: 'X-API-Version' }`) and media-type (`{ type: VersioningType.MEDIA_TYPE, key: 'v=' }`) versioning are alternatives to URI versioning, not additions: `enableVersioning` is called once.
 
-  // Or media type: Accept: application/json;v=1
-  app.enableVersioning({
-    type: VersioningType.MEDIA_TYPE,
-    key: 'v=',
-    defaultVersion: '1',
-  });
+**Correct (version-specific controllers over a version-neutral service):**
 
-  await app.listen(3000);
+```typescript
+import {
+  Controller,
+  Get,
+  Injectable,
+  NotFoundException,
+  Param,
+  UseInterceptors,
+  type CallHandler,
+  type ExecutionContext,
+  type NestInterceptor,
+} from '@nestjs/common';
+import type { Response } from 'express';
+import type { Observable } from 'rxjs';
+
+export interface User {
+  id: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  createdAt: Date;
 }
 
-// Version-specific controllers
-@Controller('users')
-@Version('1')
-export class UsersV1Controller {
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<UserV1Response> {
-    const user = await this.usersService.findOne(id);
-    // V1 response format
-    return {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-    };
-  }
-}
-
-@Controller('users')
-@Version('2')
-export class UsersV2Controller {
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<UserV2Response> {
-    const user = await this.usersService.findOne(id);
-    // V2 response format with breaking changes
-    return {
-      id: user.id,
-      firstName: user.firstName,
-      lastName: user.lastName,
-      emailAddress: user.email,
-      createdAt: user.createdAt,
-    };
-  }
-}
-
-// Per-route versioning - different versions for different routes
-@Controller('users')
-export class UsersController {
-  @Get()
-  @Version('1')
-  findAllV1(): Promise<UserV1Response[]> {
-    return this.usersService.findAllV1();
-  }
-
-  @Get()
-  @Version('2')
-  findAllV2(): Promise<UserV2Response[]> {
-    return this.usersService.findAllV2();
-  }
-
-  @Get(':id')
-  @Version(['1', '2']) // Same handler for multiple versions
-  findOne(@Param('id') id: string): Promise<User> {
-    return this.usersService.findOne(id);
-  }
-
-  @Post()
-  @Version(VERSION_NEUTRAL) // Available in all versions
-  create(@Body() dto: CreateUserDto): Promise<User> {
-    return this.usersService.create(dto);
-  }
-}
-
-// Shared service with version-specific logic
+/** Version-neutral domain logic; knows nothing about response shapes. */
 @Injectable()
 export class UsersService {
-  async findOne(id: string, version: string): Promise<any> {
-    const user = await this.repo.findOne({ where: { id } });
+  private readonly users = new Map<string, User>([
+    ['u1', { id: 'u1', firstName: 'Ann', lastName: 'Lee', email: 'ann@x.io', createdAt: new Date(0) }],
+  ]);
 
-    if (version === '1') {
-      return this.toV1Response(user);
-    }
-    return this.toV2Response(user);
-  }
-
-  private toV1Response(user: User): UserV1Response {
-    return {
-      id: user.id,
-      name: `${user.firstName} ${user.lastName}`,
-      email: user.email,
-    };
-  }
-
-  private toV2Response(user: User): UserV2Response {
-    return {
-      id: user.id,
-      firstName: user.firstName,
-      lastName: user.lastName,
-      emailAddress: user.email,
-      createdAt: user.createdAt,
-    };
+  async findOne(id: string): Promise<User> {
+    const user = this.users.get(id);
+    if (!user) throw new NotFoundException();
+    return user;
   }
 }
 
-// Controller extracts version
-@Controller('users')
-export class UsersController {
-  @Get(':id')
-  async findOne(
-    @Param('id') id: string,
-    @Headers('X-API-Version') version: string = '1',
-  ): Promise<any> {
-    return this.usersService.findOne(id, version);
-  }
+export interface UserV1Dto {
+  id: string;
+  name: string;
+  email: string;
 }
 
-// Deprecation strategy - mark old versions as deprecated
-@Controller('users')
-@Version('1')
-@UseInterceptors(DeprecationInterceptor)
-export class UsersV1Controller {
-  // All V1 routes will include deprecation warning
+export interface UserV2Dto {
+  id: string;
+  firstName: string;
+  lastName: string;
+  emailAddress: string;
+  createdAt: string;
 }
 
+/** Illustrative: announce the real date with the v2 release and keep it in one place. */
+const V1_DEPRECATED_AT = new Date('2026-11-01T00:00:00Z');
+const V1_SUNSET_AT = new Date('2027-11-01T00:00:00Z');
+
+/** RFC 9745 Deprecation + RFC 8594 Sunset headers on every v1 response. */
 @Injectable()
-export class DeprecationInterceptor implements NestInterceptor {
-  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
-    const response = context.switchToHttp().getResponse();
-    response.setHeader('Deprecation', 'true');
-    response.setHeader('Sunset', 'Sat, 1 Jan 2025 00:00:00 GMT');
+export class V1DeprecationInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const response = context.switchToHttp().getResponse<Response>();
+    response.setHeader('Deprecation', `@${V1_DEPRECATED_AT.getTime() / 1000}`);
+    response.setHeader('Sunset', V1_SUNSET_AT.toUTCString());
     response.setHeader('Link', '</v2/users>; rel="successor-version"');
-
     return next.handle();
   }
 }
+
+@Controller({ path: 'users', version: '1' })
+@UseInterceptors(V1DeprecationInterceptor)
+export class UsersV1Controller {
+  constructor(private readonly users: UsersService) {}
+
+  @Get(':id')
+  async findOne(@Param('id') id: string): Promise<UserV1Dto> {
+    const user = await this.users.findOne(id);
+    return { id: user.id, name: `${user.firstName} ${user.lastName}`, email: user.email };
+  }
+}
+
+@Controller({ path: 'users', version: '2' })
+export class UsersV2Controller {
+  constructor(private readonly users: UsersService) {}
+
+  @Get(':id')
+  async findOne(@Param('id') id: string): Promise<UserV2Dto> {
+    const user = await this.users.findOne(id);
+    return {
+      id: user.id,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      emailAddress: user.email,
+      createdAt: user.createdAt.toISOString(),
+    };
+  }
+}
 ```
+
+```typescript
+// Routes that don't change between versions
+@Controller({ path: 'status', version: VERSION_NEUTRAL })
+export class StatusController {
+  @Get()
+  status(): { ok: true } {
+    return { ok: true };
+  }
+}
+```
+
+Probe results: `GET /v1/users/u1` → `{"id":"u1","name":"Ann Lee","email":"ann@x.io"}` with `Deprecation: @1793491200` and `Sunset: Mon, 01 Nov 2027 00:00:00 GMT`; `GET /v2/users/u1` → the v2 shape without those headers; `/v3/users/u1` → 404; `/status` → 200 while `/v2/status` → 404. With URI versioning a versioned route exists only under its prefix, so unversioned `/users/u1` is 404; `defaultVersion` only assigns a version to controllers that declare none. The dates are illustrative: set them when v2 ships, give clients a migration window, and remove v1 only after its traffic is gone. Response DTOs and serialization: `api-use-dto-serialization`.
 
 Reference: [NestJS Versioning](https://docs.nestjs.com/techniques/versioning)

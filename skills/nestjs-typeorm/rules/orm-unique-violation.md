@@ -29,11 +29,18 @@ async create(sku: string, version: number) {
 ```typescript
 import { QueryFailedError } from 'typeorm';
 
-const UNIQUE_CODES = new Set(['SQLITE_CONSTRAINT_UNIQUE', 'SQLITE_CONSTRAINT_PRIMARYKEY']);
+const UNIQUE_CODES: ReadonlySet<unknown> = new Set(['SQLITE_CONSTRAINT_UNIQUE', 'SQLITE_CONSTRAINT_PRIMARYKEY']);
 
 /** True when a write failed on a UNIQUE or PRIMARY KEY constraint (better-sqlite3). */
 export function isUniqueViolation(error: unknown): boolean {
-  return error instanceof QueryFailedError && UNIQUE_CODES.has((error.driverError as { code?: string }).code ?? '');
+  if (!(error instanceof QueryFailedError)) return false;
+  const driverError: unknown = error.driverError;
+  return (
+    typeof driverError === 'object' &&
+    driverError !== null &&
+    'code' in driverError &&
+    UNIQUE_CODES.has(driverError.code)
+  );
 }
 ```
 
@@ -51,6 +58,6 @@ async create(sku: string, version: number): Promise<'created' | 'duplicate'> {
 }
 ```
 
-The write goes through `TransactionRunner` (see `orm-atomic-writes`). Back the dedup key with a `unique: true` column or primary key declared in a migration; without the constraint there is nothing to violate. Another driver needs its own codes in the set (PostgreSQL reports `23505`).
+The write goes through `TransactionRunner` (see `orm-atomic-writes`). `driverError` is narrowed with `typeof` and `in` instead of being cast, and the set is typed `ReadonlySet<unknown>` so it accepts the unchecked `code`: a driver error without a string code is simply not a unique violation. In the probe a duplicate `sku` reported `SQLITE_CONSTRAINT_UNIQUE`, a duplicate `id` `SQLITE_CONSTRAINT_PRIMARYKEY`, and the helper returned `true`, `true` and `false` for those two and a plain `Error`; the e2e `POST /api/products` mapped it to 409. Back the dedup key with a `unique: true` column or primary key declared in a migration; without the constraint there is nothing to violate. Another driver needs its own codes in the set (PostgreSQL reports `23505`).
 
 Reference: [better-sqlite3 API: SqliteError](https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#class-sqliteerror)

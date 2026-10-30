@@ -55,31 +55,29 @@ export default new DataSource(dataSourceOptions);
 ```typescript
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { dataSourceOptions } from './data-source.js';
 import { CatalogModule } from './catalog/catalog.module.js';
+import { dataSourceOptions } from './data-source.js';
+import { DatabaseModule } from './database/database.module.js';
 
 @Module({
   imports: [
     TypeOrmModule.forRootAsync({
       useFactory: () => ({ ...dataSourceOptions, migrationsRun: true, retryAttempts: 0 }),
     }),
+    DatabaseModule, // TransactionRunner, orm-atomic-writes
     CatalogModule,
   ],
 })
 export class AppModule {}
 ```
 
-**Correct (tests get a fresh, migrated in-memory database per app instance, `vitest.config.ts`):**
+**Correct (tests get a fresh, migrated in-memory database per app instance: one key in `test.env`):**
 
 ```typescript
-import swc from 'unplugin-swc';
-import { defineConfig } from 'vitest/config';
-export default defineConfig({
-  test: { globals: true, root: './', include: ['src/**/*.spec.ts', 'test/**/*.e2e-spec.ts'], env: { DB_PATH: ':memory:' } },
-  plugins: [swc.vite({ module: { type: 'es6' } })],
-});
+// vitest.config.ts, inside the existing `test.env`; the whole file is nestjs-setup's vitest-swc-configs
+DB_PATH: ':memory:',
 ```
 
-Every `:memory:` connection is a separate empty database, so each test that boots `AppModule` starts from the migrated schema with no rows. Feature modules register repositories with `TypeOrmModule.forFeature([Product])`.
+Add the key next to the ones already in `test.env` and keep the rest of the config as `nestjs-setup` defines it. Every `:memory:` connection is a separate empty database, so each app that boots `AppModule` starts from the migrated schema with no rows; `nestjs-testing` creates one app per test (`e2e-real-app-module`). `:memory:` is for the app under test only: the migration CLI runs each command in its own process and needs a file database (`migration-cli-ts-node-esm`). Feature modules register repositories with `TypeOrmModule.forFeature([Product])`.
 
 Reference: [NestJS docs: Database (TypeORM)](https://docs.nestjs.com/techniques/database)

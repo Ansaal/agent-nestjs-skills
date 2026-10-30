@@ -36,62 +36,58 @@ export class UsersService {
 }
 ```
 
-**Correct (custom repository with encapsulated queries):**
+**Correct (custom repository with encapsulated queries and writes):**
 
 ```typescript
-// Custom repository with encapsulated queries
+// users/users.repository.ts
 @Injectable()
 export class UsersRepository {
   constructor(
-    @InjectRepository(User) private repo: Repository<User>,
+    @InjectRepository(User) private readonly users: Repository<User>,
+    private readonly transactions: TransactionRunner,
   ) {}
 
-  async findById(id: string): Promise<User | null> {
-    return this.repo.findOne({ where: { id } });
+  findById(id: string): Promise<User | null> {
+    return this.users.findOneBy({ id });
   }
 
-  async findByEmail(email: string): Promise<User | null> {
-    return this.repo.findOne({ where: { email } });
-  }
-
-  async findActiveWithMinOrders(minOrders: number): Promise<User[]> {
-    return this.repo
+  findActiveWithMinOrders(minOrders: number): Promise<User[]> {
+    return this.users
       .createQueryBuilder('user')
-      .leftJoinAndSelect('user.orders', 'order')
+      .leftJoin('user.orders', 'order') // joined to count, not selected
       .where('user.isActive = :active', { active: true })
-      .andWhere('user.deletedAt IS NULL')
       .groupBy('user.id')
       .having('COUNT(order.id) >= :min', { min: minOrders })
       .orderBy('user.createdAt', 'DESC')
       .getMany();
   }
 
-  async save(user: User): Promise<User> {
-    return this.repo.save(user);
+  /** A duplicate email rejects with the unique-constraint violation; the caller maps it. */
+  insert(data: Pick<User, 'email' | 'name'>): Promise<User> {
+    return this.transactions.run((manager) => manager.save(User, { ...data, roles: ['member'] }));
   }
 }
 
-// Clean service with business logic only
+// users/users.service.ts: business rules only
 @Injectable()
 export class UsersService {
-  constructor(private usersRepo: UsersRepository) {}
+  constructor(private readonly usersRepo: UsersRepository) {}
 
-  async getActiveUsersWithOrders(): Promise<User[]> {
+  getActiveUsersWithOrders(): Promise<User[]> {
     return this.usersRepo.findActiveWithMinOrders(1);
   }
 
   async create(dto: CreateUserDto): Promise<User> {
-    const existing = await this.usersRepo.findByEmail(dto.email);
-    if (existing) {
-      throw new ConflictException('Email already registered');
+    try {
+      return await this.usersRepo.insert({ email: dto.email, name: dto.name });
+    } catch (error) {
+      if (isUniqueViolation(error)) throw new ConflictException('Email already registered');
+      throw error;
     }
-
-    const user = new User();
-    user.email = dto.email;
-    user.name = dto.name;
-    return this.usersRepo.save(user);
   }
 }
 ```
+
+No `findByEmail` pre-check: two concurrent requests both see "absent", so the unique index on `email` decides and the service maps its violation to 409 (in the probe a second `POST /users` with the same email answered `409 {"message":"Email already registered",…}`). Persistence rules are owned by `nestjs-typeorm`: every write through `TransactionRunner` (`orm-atomic-writes`), `isUniqueViolation()` and the driver codes (`orm-unique-violation`), `Relation<T>` and the 1.x find forms (`orm-relation-wrapper`, `orm-v1-removed-apis`).
 
 Reference: [Repository Pattern](https://martinfowler.com/eaaCatalog/repository.html)

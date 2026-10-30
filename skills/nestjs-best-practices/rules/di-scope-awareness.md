@@ -66,14 +66,17 @@ export class RequestContextService {
 
 // Better: Use NestJS built-in request context
 import { REQUEST } from '@nestjs/core';
-import { Request } from 'express';
+import type { AuthenticatedRequest } from '../auth/authenticated-request.js'; // security-use-guards
 
 @Injectable({ scope: Scope.REQUEST })
 export class AuditService {
-  constructor(@Inject(REQUEST) private request: Request) {}
+  private readonly logger = new Logger(AuditService.name);
 
-  log(action: string) {
-    console.log(`User ${this.request.user?.id} performed ${action}`);
+  constructor(@Inject(REQUEST) private readonly request: AuthenticatedRequest) {}
+
+  record(action: string) {
+    // Opaque identifier only, never names or emails
+    this.logger.debug('Action performed', { userId: this.request.user?.id, action });
   }
 }
 
@@ -82,11 +85,13 @@ import { ClsService } from 'nestjs-cls';
 
 @Injectable() // Stays singleton!
 export class AuditService {
+  private readonly logger = new Logger(AuditService.name);
+
   constructor(private cls: ClsService) {}
 
-  log(action: string) {
+  record(action: string) {
     const userId = this.cls.get('userId');
-    console.log(`User ${userId} performed ${action}`);
+    this.logger.debug('Action performed', { userId, action });
   }
 }
 ```

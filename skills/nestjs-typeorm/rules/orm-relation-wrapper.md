@@ -7,7 +7,7 @@ tags: typeorm, entities, relations, esm, swc, decorators
 
 ## Type Relation Properties as Relation<T>
 
-Two entities that reference each other import each other. With `emitDecoratorMetadata`, SWC emits `_ts_metadata("design:type", typeof Category === "undefined" ? Object : Category)` for a property typed `Category`; in ESM the imported class is still in its temporal dead zone while the cycle loads, and even `typeof` throws. The built app (`node dist/src/main.js`) and the TypeORM CLI then fail with `ReferenceError: Cannot access 'Category' before initialization`. Vitest can pass at the same time because its import order differs, so a green test run does not prove the entities are safe. `Relation<T>` (`type Relation<T> = T`) is type-only, so the emitted metadata falls back to `Object` and the cycle disappears; the arrow functions in the decorators already tell TypeORM the target entity.
+Two entities that reference each other import each other. With `emitDecoratorMetadata`, SWC emits `_ts_metadata("design:type", typeof Category === "undefined" ? Object : Category)` for a property typed `Category`; in ESM the imported class is still in its temporal dead zone while the cycle loads, and even `typeof` throws. The built app (`node dist/main.js`) and the TypeORM CLI then fail with `ReferenceError: Cannot access 'Category' before initialization`. Vitest can pass at the same time because its import order differs, so a green test run does not prove the entities are safe. `Relation<T>` (`type Relation<T> = T`) is type-only, so the emitted metadata falls back to `Object` and the cycle disappears; the arrow functions in the decorators already tell TypeORM the target entity.
 
 **Incorrect (bare entity types on relation properties):**
 

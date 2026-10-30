@@ -32,21 +32,23 @@ import { vi } from 'vitest';
 export function autoMock(token?: InjectionToken): Record<string, unknown> {
   const mock: Record<string, unknown> = {};
   if (typeof token !== 'function') return mock;
-  for (let proto = token.prototype; proto && proto !== Object.prototype; proto = Object.getPrototypeOf(proto)) {
+  let proto: unknown = token.prototype;
+  while (typeof proto === 'object' && proto !== null && proto !== Object.prototype) {
     for (const key of Object.getOwnPropertyNames(proto)) {
       if (key !== 'constructor' && !(key in mock)) mock[key] = vi.fn();
     }
+    proto = Object.getPrototypeOf(proto);
   }
   return mock;
 }
 ```
 
 ```typescript
-// src/products/sync.dispatcher.spec.ts
+// src/sync/sync.dispatcher.spec.ts
 import { Test, type TestingModule } from '@nestjs/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { autoMock } from '../../test/auto-mock.js';
-import { SyncService } from '../sync.service.js';
+import { SyncService } from './sync.service.js';
 import { SyncDispatcher } from './sync.dispatcher.js';
 
 describe('SyncDispatcher', () => {
@@ -68,9 +70,18 @@ describe('SyncDispatcher', () => {
 
     expect(sync.sync).toHaveBeenCalledWith('p-1');
   });
+
+  it('settles drain() when the sync itself rejects', async () => {
+    vi.mocked(moduleRef.get(SyncService)).sync.mockRejectedValue(new Error('dead-letter store down'));
+
+    const dispatcher = moduleRef.get(SyncDispatcher);
+    dispatcher.dispatch('p-1');
+
+    await expect(dispatcher.drain()).resolves.toBeUndefined();
+  });
 });
 ```
 
-`autoMock` mocks the methods of class tokens. String and symbol tokens, and methods whose return value the unit calls further, need a specific double (`unit-specific-doubles`). Unit specs sit next to their source as `*.spec.ts`.
+`autoMock` mocks the methods of class tokens. String and symbol tokens, and methods whose return value the unit calls further, need a specific double (`unit-specific-doubles`). Unit specs sit next to their source as `*.spec.ts`. `token.prototype` is `any`; walking it as `unknown` with a type guard keeps `autoMock` clean under `recommendedTypeChecked`, where a `let proto = token.prototype` loop failed `pnpm lint` with ``Unsafe assignment of an `any` value  @typescript-eslint/no-unsafe-assignment``. The `expect(sync.sync)` matchers rely on `unbound-method` being off for test files (`nestjs-setup`, `lint-type-aware-flat-config`).
 
 Reference: [NestJS – Testing: Auto mocking](https://docs.nestjs.com/fundamentals/testing#auto-mocking)

@@ -54,15 +54,18 @@ export class UsersModule {}
 })
 export class OrdersModule {}
 
-// Option 2: Use events for decoupled communication
+// Option 2: Use events for decoupled communication (best-effort reactions only; see arch-use-events)
 // users.service.ts
 @Injectable()
 export class UsersService {
-  constructor(private eventEmitter: EventEmitter2) {}
+  constructor(
+    private readonly usersRepo: UsersRepository, // writes through TransactionRunner (nestjs-typeorm)
+    private readonly eventEmitter: EventEmitter2,
+  ) {}
 
-  async createUser(data: CreateUserDto) {
-    const user = await this.userRepo.save(data);
-    this.eventEmitter.emit('user.created', user);
+  async createUser(dto: CreateUserDto): Promise<User> {
+    const user = await this.usersRepo.insert(dto);
+    this.eventEmitter.emit('user.created', new UserCreatedEvent(user.id));
     return user;
   }
 }
@@ -71,8 +74,8 @@ export class UsersService {
 @Injectable()
 export class OrdersService {
   @OnEvent('user.created')
-  handleUserCreated(user: User) {
-    // React to user creation without direct dependency
+  async handleUserCreated(event: UserCreatedEvent): Promise<void> {
+    // React to user creation without importing UsersModule
   }
 }
 ```

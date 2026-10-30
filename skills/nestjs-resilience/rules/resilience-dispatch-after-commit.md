@@ -22,7 +22,7 @@ async cancel(orderId: string): Promise<OrderEntity> {
 }
 ```
 
-**Correct (commit, then dispatch a call that never rejects):**
+**Correct (commit, then hand the call to a dispatcher that never rejects):**
 
 ```typescript
 async cancel(orderId: string): Promise<OrderEntity> {
@@ -31,11 +31,11 @@ async cancel(orderId: string): Promise<OrderEntity> {
     return manager.findOneByOrFail(OrderEntity, { id: orderId });
   });
   // Committed: the carrier only sees state that exists. The response doesn't wait for it.
-  void this.orderSync.push({ id: order.id, status: order.status });
+  this.orderSync.dispatch({ id: order.id, status: order.status });
   return order;
 }
 ```
 
-`orderSync.push()` runs the call under the `carrier` policy and records a dead letter instead of rejecting (`dlq-record-final-failure`). A crash between commit and dispatch still loses the call; when every committed change must reach the dependency, write an outbox row in the same transaction and dispatch from it. `this.transactions` is the transaction runner from `nestjs-typeorm` (`orm-atomic-writes`); asserting on a dispatch the response doesn't wait for (an awaitable `drain()`, `async-drain-side-effects`) is `nestjs-testing`.
+`orderSync.dispatch()` runs the call under the `carrier` policy, records a dead letter when it still fails, ends in a `.catch` that logs `error` if the dead-letter store fails too, and tracks the job so `drain()` and shutdown wait for it (`dlq-record-final-failure`). `void this.orderSync.push(…)` is not enough: `push()` rejects when the store does, and nothing waits for it. A crash between commit and dispatch still loses the call; when every committed change must reach the dependency, write an outbox row in the same transaction and dispatch from it. `this.transactions` is the transaction runner from `nestjs-typeorm` (`orm-atomic-writes`); tests await `orderSync.drain()` after the response (`async-drain-side-effects` in `nestjs-testing`).
 
 Reference: [NestJS Resilience – Use the same policies inside services](https://docs.nestjs.com/reliability/resilience#use-the-same-policies-inside-services)

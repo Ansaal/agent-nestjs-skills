@@ -65,24 +65,6 @@ export class OrdersService {
   }
 }
 
-// Easy to test with mocks
-describe('OrdersService', () => {
-  let service: OrdersService;
-
-  beforeEach(async () => {
-    const module = await Test.createTestingModule({
-      providers: [
-        OrdersService,
-        { provide: UsersService, useValue: mockUsersService },
-        { provide: InventoryService, useValue: mockInventoryService },
-        { provide: PaymentService, useValue: mockPaymentService },
-      ],
-    }).compile();
-
-    service = module.get(OrdersService);
-  });
-});
-
 // VALID: Factory pattern for dynamic instantiation
 @Injectable()
 export class HandlerFactory {
@@ -100,5 +82,7 @@ export class HandlerFactory {
   }
 }
 ```
+
+Constructor dependencies are what lets a unit test compile `OrdersService` alone and have `useMocker(autoMock)` supply the rest; `ModuleRef.get()` lookups are invisible to it. Test structure is owned by `nestjs-testing` (`unit-automock-dependencies`).
 
 Reference: [NestJS Module Reference](https://docs.nestjs.com/fundamentals/module-ref)

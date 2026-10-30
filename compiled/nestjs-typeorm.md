@@ -14,7 +14,7 @@ October 2026
 
 ## Abstract
 
-TypeORM 1.x persistence for NestJS 12 ESM projects on better-sqlite3. Use when installing or configuring TypeORM, writing entities with relations, generating or running migrations, or writing concurrent updates and duplicate-key handling.
+TypeORM 1.x persistence for NestJS 12 ESM projects on better-sqlite3. Use when installing or configuring TypeORM, writing entities with relations, generating, checking or running migrations, writing transactions (`TransactionRunner`, nested service calls) or concurrent updates, deciding which reads must see only committed rows, or handling duplicate keys.
 
 ---
 
@@ -39,13 +39,15 @@ TypeORM 1.x persistence for NestJS 12 ESM projects on better-sqlite3. Use when i
 
 ### 1.1 Write Atomically with Guarded Updates and Serialized Transactions
 
-**Impact: CRITICAL** — Lost updates, version regressions, and concurrent requests failing inside transactions
+**Impact: CRITICAL** — Lost updates, version regressions, rolled-back reads, and concurrent requests failing inside transactions
 
 Read-then-write (`findOneBy`, compare in JavaScript, `save`) lets two overlapping requests both pass the check, so an older version can overwrite a newer one. Put the condition into the statement instead: `UPDATE … WHERE sku = :id AND version < :version` is atomic on its own, and the `UpdateResult.affected` count (populated by better-sqlite3 from `changes`, `0` when the guard rejects) tells you whether the write happened.
 
-When several statements must commit together, run them in `dataSource.transaction(async (manager) => …)` and issue every statement through that `manager`. better-sqlite3 gives a `DataSource` one shared connection and one shared `QueryRunner`, so transactions from concurrent requests collide. Two that start in the same tick fail with `QueryFailedError: SqliteError: cannot start a transaction within a transaction`. One that starts while another is open runs as a savepoint inside it: it resolves as committed, and its rows vanish when the outer transaction rolls back. Route every transaction through one app-wide `TransactionRunner` that runs them one at a time.
+When several statements must commit together, they run in one transaction and every statement goes through its `manager`. better-sqlite3 gives a `DataSource` one shared connection and one shared `QueryRunner`, so transactions from concurrent requests collide: two `dataSource.transaction()` calls started in the same tick failed with `QueryFailedError: SqliteError: cannot start a transaction within a transaction` and `TransactionNotStartedError`. A statement issued from elsewhere while a transaction is open runs inside it and is rolled back with it. Route every transaction through one app-wide `TransactionRunner` that runs them one at a time.
 
-**Incorrect (read-then-write; unserialized transactions):**
+Services compose, so a transactional method calls another one that also uses `run()`. A plain queue deadlocks there: the inner call waits for the outer one to finish, and the outer one waits for the inner result (in the probe it was still pending after 1 s). The runner therefore keeps the open transaction's manager in `AsyncLocalStorage`, and a `run()` inside it joins that transaction instead of queueing. The runner clears the manager as soon as the outer work settles, so a callback that inherited the context and fires later (a timer, such as a lock renewal started inside a transaction) queues like any top-level call instead of writing through a finished transaction, and the context it holds no longer references that manager. Both paths call `work` through `.then()`, so a synchronous throw rejects the returned promise instead of throwing at the call site.
+
+**Incorrect (read-then-write; unserialized transactions; a queue that cannot nest):**
 
 ```typescript
 async applySnapshot(sku: string, version: number) {
@@ -56,23 +58,53 @@ async applySnapshot(sku: string, version: number) {
 
 await Promise.all([a, b].map((v) => this.dataSource.transaction((manager) => apply(manager, v))));
 // QueryFailedError: SqliteError: cannot start a transaction within a transaction
+
+run<T>(work: (manager: EntityManager) => Promise<T>): Promise<T> {
+  const result = this.tail.then(() => this.dataSource.transaction(work));
+  this.tail = result.catch(() => undefined);
+  return result; // a run() inside work waits for this one forever
+}
 ```
 
 **Correct (`src/database/transaction-runner.ts`, provided once app-wide):**
 
 ```typescript
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Injectable } from '@nestjs/common';
 import { DataSource, type EntityManager } from 'typeorm';
 
-/** better-sqlite3 gives a DataSource one shared connection, so transactions must run one at a time. */
+interface ActiveTransaction {
+  /** Cleared when the outer work settles, so contexts that outlive the transaction hold no manager. */
+  manager?: EntityManager;
+}
+
+/**
+ * better-sqlite3 gives a DataSource one shared connection, so transactions run one at a time.
+ * A run() inside an open transaction joins it instead of queueing behind it.
+ */
 @Injectable()
 export class TransactionRunner {
+  private readonly active = new AsyncLocalStorage<ActiveTransaction>();
   private tail: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly dataSource: DataSource) {}
 
   run<T>(work: (manager: EntityManager) => Promise<T>): Promise<T> {
-    const result = this.tail.then(() => this.dataSource.transaction(work));
+    // `.then(work)`: a synchronous throw in work rejects the returned promise on both paths.
+    const joined = this.active.getStore()?.manager;
+    if (joined) return Promise.resolve(joined).then(work);
+
+    const result = this.tail.then(() =>
+      this.dataSource.transaction((manager) => {
+        const transaction: ActiveTransaction = { manager };
+        return this.active
+          .run(transaction, () => Promise.resolve(manager).then(work))
+          .finally(() => {
+            // Callbacks that inherited this context and fire later (timers) now queue like top-level calls.
+            transaction.manager = undefined;
+          });
+      }),
+    );
     this.tail = result.catch(() => undefined);
     return result;
   }
@@ -80,6 +112,7 @@ export class TransactionRunner {
 ```
 
 ```typescript
+// src/database/database.module.ts
 import { Global, Module } from '@nestjs/common';
 import { TransactionRunner } from './transaction-runner.js';
 
@@ -95,10 +128,7 @@ export type ApplyResult = 'inserted' | 'updated' | 'stale';
 
 @Injectable()
 export class ProductService {
-  constructor(
-    private readonly transactions: TransactionRunner,
-    @InjectRepository(Product) private readonly products: Repository<Product>,
-  ) {}
+  constructor(private readonly transactions: TransactionRunner) {}
 
   /** Applies a snapshot only if its version is newer than the stored one. */
   applySnapshot(sku: string, version: number): Promise<ApplyResult> {
@@ -119,9 +149,67 @@ export class ProductService {
 }
 ```
 
-Import `DatabaseModule` once in `AppModule`. Send every write through `run()`, single statements included: while a transaction is open, a statement from another request on the shared connection runs inside it and is rolled back with it (a plain `repository.insert` issued during a failing transaction left 0 rows), and reads outside `run()` can see its uncommitted rows. A failed `work` rolls back and the next queued transaction still runs. Keep `run()` calls out of `work` itself (the nested call waits for the outer one forever); pass `manager` down instead. Seven concurrent `applySnapshot` calls with versions `5, 3, 9, 1, 7, 2, 8` leave version `9` stored.
+**Correct (`test/transaction-runner.e2e-spec.ts`, the runner's contract):**
 
-Reference: [NestJS docs: Database transactions](https://docs.nestjs.com/techniques/database#transactions)
+```typescript
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import { getRepositoryToken } from '@nestjs/typeorm';
+import type { Repository } from 'typeorm';
+import { Product } from '../src/catalog/product.entity.js';
+import { TransactionRunner } from '../src/database/transaction-runner.js';
+import { createTestApp } from './support/test-app.js';
+
+let app: NestExpressApplication;
+let runner: TransactionRunner;
+let products: Repository<Product>;
+
+beforeEach(async () => {
+  app = await createTestApp();
+  runner = app.get(TransactionRunner);
+  products = app.get<Repository<Product>>(getRepositoryToken(Product));
+  return () => app.close();
+});
+
+it('rolls back the outer transaction when a nested run() throws', async () => {
+  const outcome = runner.run(async (manager) => {
+    await manager.insert(Product, { sku: 'outer', version: 1 });
+    await runner.run(async (inner) => {
+      await inner.insert(Product, { sku: 'inner', version: 1 });
+      throw new Error('inner failed');
+    });
+  });
+
+  await expect(outcome).rejects.toThrow('inner failed');
+  expect(await products.count()).toBe(0);
+});
+
+it('serializes concurrent top-level runs', async () => {
+  const log: string[] = [];
+  const tx = (name: string) =>
+    runner.run(async (manager) => {
+      log.push(`start ${name}`);
+      await manager.insert(Product, { sku: name, version: 1 });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      log.push(`end ${name}`);
+    });
+
+  await Promise.all([tx('a'), tx('b'), tx('c')]);
+
+  expect(log).toEqual(['start a', 'end a', 'start b', 'end b', 'start c', 'end c']);
+});
+```
+
+Import `DatabaseModule` once in `AppModule` (`orm-single-data-source`). Send every write through `run()`, single statements included, directly or through a service whose method calls it. Await nested `run()` calls inside `work`; the join lasts only until the outer `work` settles. In the probe, against an app with a migrated `:memory:` database:
+
+- A nested `run()` completed and both rows committed; the same code on the plain queue was still pending after 1 s.
+- A throw in the nested `run()` rejected the outer one and left 0 rows. A join has no savepoint: when the outer `work` caught the inner error and went on, the inner row committed with the outer one.
+- A nested `run()` whose callback threw synchronously returned a rejected promise; calling `work(manager)` directly on the join path threw at the call site instead.
+- Three concurrent top-level runs logged `start a, end a, start b, end b, start c, end c`, and seven concurrent `applySnapshot` calls with versions `5, 3, 9, 1, 7, 2, 8` left version `9` stored.
+- A `setTimeout` started inside a transaction fired after its commit while another request's transaction was open and then rolled back; its insert queued behind that transaction and survived, and the store it inherited read `{ manager: undefined }`. A variant that kept joining after the outer work settled wrote the insert into the other request's transaction, and the rollback removed it; one that only flagged the context closed still held the `EntityManager`.
+
+Reads follow one contract. A read that decides a write, or whose result must not include rows another request may still roll back, goes through `run()` together with the write it decides, on the same `manager`. A plain repository read runs on the shared connection whenever it is issued, including in the middle of someone else's transaction: in the probe, `products.countBy({ sku })` during an open transaction returned `1` for a row that was rolled back moments later, while the same count through `run()` waited for the rollback and returned `0`. Use plain repository reads only for data where that is acceptable, such as display lists.
+
+Reference: [NestJS docs: Database transactions](https://docs.nestjs.com/techniques/database#transactions), [Node.js: AsyncLocalStorage](https://nodejs.org/api/async_context.html#class-asynclocalstorage)
 
 ---
 
@@ -129,7 +217,7 @@ Reference: [NestJS docs: Database transactions](https://docs.nestjs.com/techniqu
 
 **Impact: HIGH** — Circular entity imports crash the built app and the TypeORM CLI with a TDZ ReferenceError
 
-Two entities that reference each other import each other. With `emitDecoratorMetadata`, SWC emits `_ts_metadata("design:type", typeof Category === "undefined" ? Object : Category)` for a property typed `Category`; in ESM the imported class is still in its temporal dead zone while the cycle loads, and even `typeof` throws. The built app (`node dist/src/main.js`) and the TypeORM CLI then fail with `ReferenceError: Cannot access 'Category' before initialization`. Vitest can pass at the same time because its import order differs, so a green test run does not prove the entities are safe. `Relation<T>` (`type Relation<T> = T`) is type-only, so the emitted metadata falls back to `Object` and the cycle disappears; the arrow functions in the decorators already tell TypeORM the target entity.
+Two entities that reference each other import each other. With `emitDecoratorMetadata`, SWC emits `_ts_metadata("design:type", typeof Category === "undefined" ? Object : Category)` for a property typed `Category`; in ESM the imported class is still in its temporal dead zone while the cycle loads, and even `typeof` throws. The built app (`node dist/main.js`) and the TypeORM CLI then fail with `ReferenceError: Cannot access 'Category' before initialization`. Vitest can pass at the same time because its import order differs, so a green test run does not prove the entities are safe. `Relation<T>` (`type Relation<T> = T`) is type-only, so the emitted metadata falls back to `Object` and the cycle disappears; the arrow functions in the decorators already tell TypeORM the target entity.
 
 **Incorrect (bare entity types on relation properties):**
 
@@ -232,32 +320,30 @@ export default new DataSource(dataSourceOptions);
 ```typescript
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { dataSourceOptions } from './data-source.js';
 import { CatalogModule } from './catalog/catalog.module.js';
+import { dataSourceOptions } from './data-source.js';
+import { DatabaseModule } from './database/database.module.js';
 
 @Module({
   imports: [
     TypeOrmModule.forRootAsync({
       useFactory: () => ({ ...dataSourceOptions, migrationsRun: true, retryAttempts: 0 }),
     }),
+    DatabaseModule, // TransactionRunner, orm-atomic-writes
     CatalogModule,
   ],
 })
 export class AppModule {}
 ```
 
-**Correct (tests get a fresh, migrated in-memory database per app instance, `vitest.config.ts`):**
+**Correct (tests get a fresh, migrated in-memory database per app instance: one key in `test.env`):**
 
 ```typescript
-import swc from 'unplugin-swc';
-import { defineConfig } from 'vitest/config';
-export default defineConfig({
-  test: { globals: true, root: './', include: ['src/**/*.spec.ts', 'test/**/*.e2e-spec.ts'], env: { DB_PATH: ':memory:' } },
-  plugins: [swc.vite({ module: { type: 'es6' } })],
-});
+// vitest.config.ts, inside the existing `test.env`; the whole file is nestjs-setup's vitest-swc-configs
+DB_PATH: ':memory:',
 ```
 
-Every `:memory:` connection is a separate empty database, so each test that boots `AppModule` starts from the migrated schema with no rows. Feature modules register repositories with `TypeOrmModule.forFeature([Product])`.
+Add the key next to the ones already in `test.env` and keep the rest of the config as `nestjs-setup` defines it. Every `:memory:` connection is a separate empty database, so each app that boots `AppModule` starts from the migrated schema with no rows; `nestjs-testing` creates one app per test (`e2e-real-app-module`). `:memory:` is for the app under test only: the migration CLI runs each command in its own process and needs a file database (`migration-cli-ts-node-esm`). Feature modules register repositories with `TypeOrmModule.forFeature([Product])`.
 
 Reference: [NestJS docs: Database (TypeORM)](https://docs.nestjs.com/techniques/database)
 
@@ -289,11 +375,18 @@ async create(sku: string, version: number) {
 ```typescript
 import { QueryFailedError } from 'typeorm';
 
-const UNIQUE_CODES = new Set(['SQLITE_CONSTRAINT_UNIQUE', 'SQLITE_CONSTRAINT_PRIMARYKEY']);
+const UNIQUE_CODES: ReadonlySet<unknown> = new Set(['SQLITE_CONSTRAINT_UNIQUE', 'SQLITE_CONSTRAINT_PRIMARYKEY']);
 
 /** True when a write failed on a UNIQUE or PRIMARY KEY constraint (better-sqlite3). */
 export function isUniqueViolation(error: unknown): boolean {
-  return error instanceof QueryFailedError && UNIQUE_CODES.has((error.driverError as { code?: string }).code ?? '');
+  if (!(error instanceof QueryFailedError)) return false;
+  const driverError: unknown = error.driverError;
+  return (
+    typeof driverError === 'object' &&
+    driverError !== null &&
+    'code' in driverError &&
+    UNIQUE_CODES.has(driverError.code)
+  );
 }
 ```
 
@@ -311,7 +404,7 @@ async create(sku: string, version: number): Promise<'created' | 'duplicate'> {
 }
 ```
 
-The write goes through `TransactionRunner` (see `orm-atomic-writes`). Back the dedup key with a `unique: true` column or primary key declared in a migration; without the constraint there is nothing to violate. Another driver needs its own codes in the set (PostgreSQL reports `23505`).
+The write goes through `TransactionRunner` (see `orm-atomic-writes`). `driverError` is narrowed with `typeof` and `in` instead of being cast, and the set is typed `ReadonlySet<unknown>` so it accepts the unchecked `code`: a driver error without a string code is simply not a unique violation. In the probe a duplicate `sku` reported `SQLITE_CONSTRAINT_UNIQUE`, a duplicate `id` `SQLITE_CONSTRAINT_PRIMARYKEY`, and the helper returned `true`, `true` and `false` for those two and a plain `Error`; the e2e `POST /api/products` mapped it to 409. Back the dedup key with a `unique: true` column or primary key declared in a migration; without the constraint there is nothing to violate. Another driver needs its own codes in the set (PostgreSQL reports `23505`).
 
 Reference: [better-sqlite3 API: SqliteError](https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#class-sqliteerror)
 
@@ -394,16 +487,21 @@ Reference: [TypeORM 1.0 upgrade guide](https://typeorm.io/docs/releases/1.0/upgr
 
 ### 2.1 Run the TypeORM CLI through typeorm-ts-node-esm Scripts
 
-**Impact: HIGH** — Other runners cannot load the TypeScript DataSource or lose decorator metadata
+**Impact: HIGH** — Other runners cannot load the TypeScript DataSource or lose decorator metadata; generating against the wrong database re-emits existing tables
 
-The CLI has to load `src/data-source.ts`, its `.js`-suffixed ESM imports, and decorator metadata. `typeorm-ts-node-esm` (a bin shipped by `typeorm`; needs the `ts-node` devDependency) does all three. Plain `typeorm` runs on Node and fails with `Unable to open file: "…/src/data-source.ts". Cannot find module '…/src/catalog/category.entity.js'`. `tsx node_modules/typeorm/cli.js` loads the file, but esbuild emits no decorator metadata, so it fails with `ColumnTypeUndefinedError: Column type for Product#sku is not defined and cannot be guessed`. Wrap the commands in package scripts so the runner and `-d` path are written once.
+The CLI has to load `src/data-source.ts`, its `.js`-suffixed ESM imports, and decorator metadata. `typeorm-ts-node-esm` (a bin shipped by `typeorm`; needs the `ts-node` devDependency) does all three. Plain `typeorm` runs on Node and fails with `Unable to open file: "…/src/data-source.ts". Cannot find module '…/src/catalog/category.entity.js'`. `tsx node_modules/typeorm/cli.js` loads the file, but esbuild emits no decorator metadata, so it fails with `Column type for Product#sku is not defined and cannot be guessed`. Wrap the commands in package scripts so the runner and `-d` path are written once.
 
-**Incorrect (wrong runner, no data source flag):**
+`migration:generate` diffs the entities against the database at `DB_PATH`, so that database must hold every registered migration. Each CLI command is its own process, and with `DB_PATH=:memory:` (the test value, `orm-single-data-source`) each opens a new empty database: after `migration:run` had executed both migrations, `migration:check` in the next process still reported `Unexpected changes in database schema were found in check mode:` followed by `CREATE TABLE "products" …`. Run the commands in one subshell against a new file in a `mktemp -d` directory, with an `EXIT` trap that deletes only that directory. A fixed path such as `./tmp/migrations.sqlite` survives a failed command, so the next run no longer starts empty, and deleting its folder takes unrelated files with it.
+
+The generated file imports `MigrationInterface` and `QueryRunner` as values (`import { MigrationInterface, QueryRunner } from "typeorm";`), which fails the lint gate of `nestjs-setup`: ``All imports in the declaration are only used as types. Use `import type`  @typescript-eslint/consistent-type-imports``. Fix and format the file before registering it. With `projectService` the autofix is safe here (`lint-decorator-type-imports`) and rewrote it to `import type { MigrationInterface, QueryRunner } from 'typeorm';`. The value import also breaks loading by path glob (`migration-list-classes`).
+
+**Incorrect (wrong runner, no data source flag, generated against `:memory:`):**
 
 ```bash
 npx typeorm migration:run -d src/data-source.ts
 npx tsx node_modules/typeorm/cli.js migration:generate src/migrations/AddProductTitle -d src/data-source.ts
 npx typeorm-ts-node-esm migration:run   # Missing required argument: dataSource
+DB_PATH=:memory: pnpm migration:generate src/migrations/AddProductTitle   # re-emits every table
 ```
 
 **Correct (`package.json` scripts):**
@@ -421,18 +519,36 @@ npx typeorm-ts-node-esm migration:run   # Missing required argument: dataSource
 }
 ```
 
-**Correct (schema change workflow):**
+**Correct (schema change workflow, each database fresh and removed on exit):**
 
 ```bash
-pnpm migration:run                                    # bring the local DB (DB_PATH, default data.sqlite) up to date first
-pnpm migration:generate src/migrations/AddProductTitle # diff entities vs that DB → src/migrations/<timestamp>-AddProductTitle.ts
-# register the class in src/data-source.ts (migration-list-classes)
-pnpm migration:run
-pnpm migration:show                                   # every line [X]
-pnpm migration:check                                  # "No changes in database schema were found", exit 0
+(
+  set -eu
+  dir=$(mktemp -d)                                # own line: set -e stops here if mktemp fails
+  trap 'rm -rf "$dir"' EXIT                       # removes only this run's database, on failure too
+  export DB_PATH="$dir/migrations.sqlite"
+  pnpm migration:run                              # bring it up to every registered migration first
+  pnpm migration:generate src/migrations/AddProductTitle
+)
+pnpm exec eslint --fix src/migrations && pnpm exec prettier --write src/migrations   # import type, house style
+# register the class in src/data-source.ts (migration-list-classes), then run the CI check below
 ```
 
-`migration:generate` diffs entities against the database at `DB_PATH`; against an empty or stale database it re-emits tables that earlier migrations already create, so run pending migrations before generating. `migration:create src/migrations/BackfillTitles` writes an empty migration for data changes and needs no `-d`. `migration:revert` undoes the latest executed migration. In CI, `migration:check` exits 1 with `Unexpected changes in database schema were found in check mode` when an entity change has no migration.
+**Correct (CI, and the check after registering):**
+
+```bash
+(
+  set -eu
+  dir=$(mktemp -d)
+  trap 'rm -rf "$dir"' EXIT
+  export DB_PATH="$dir/migrations.sqlite"
+  pnpm migration:run
+  pnpm migration:show                             # every line [X]
+  pnpm migration:check                            # "No changes in database schema were found", exit 0
+)
+```
+
+CI runs `migration:run` first because `migration:check` only compares: against a database without the migrations it reports every table as an unexpected change. With them applied, an entity change that has no migration exits 1 with `Unexpected changes in database schema were found in check mode`. In the probe, generation touched only the changed table (SQLite rebuilds it through `temporary_products`); under both bash and zsh the CI block listed `[X]` for each class and printed `No changes in database schema were found`, and a `false` inserted after `migration:run` exited the subshell with 1 while the trap still removed the database directory and left a file in `./tmp` in place. `migration:create src/migrations/BackfillTitles` writes an empty migration for data changes and needs no `-d`. `migration:revert` undoes the latest executed migration.
 
 Reference: [TypeORM: Migrations](https://typeorm.io/docs/migrations/why)
 
@@ -442,7 +558,7 @@ Reference: [TypeORM: Migrations](https://typeorm.io/docs/migrations/why)
 
 **Impact: HIGH** — Glob paths crash tests and the built app; unregistered migrations are silently skipped
 
-Path globs make TypeORM `import()` the matched files itself, outside any TypeScript loader, so Node's built-in type stripping loads `src/migrations/*.ts`. Under Vitest and in the built app (`node dist/src/main.js`), the generated `import { MigrationInterface, QueryRunner } from "typeorm"` then fails with `SyntaxError: The requested module 'typeorm' does not provide an export named 'MigrationInterface'`, because those names are types. A `dist/**/*.js` glob misses the `.ts` files the CLI and Vitest load, and `__dirname` does not exist in ESM. Import the migration classes and list them: the same array then works in the CLI, Vitest, and the built app.
+Path globs make TypeORM `import()` the matched files itself, outside any TypeScript loader, so Node's built-in type stripping loads `src/migrations/*.ts`. A generated migration whose `import { MigrationInterface, QueryRunner } from "typeorm"` is still a value import then fails under Vitest and in the built app (`node dist/main.js`) with `SyntaxError: The requested module 'typeorm' does not provide an export named 'MigrationInterface'`, because those names are types. After the import is converted (`migration-cli-ts-node-esm`), the glob still works only where `src/` sits next to `dist/`: the same build copied without `src/` logged `Nest application successfully started` against a database that held only the `migrations` table. A `dist/**/*.js` glob misses the `.ts` files the CLI and Vitest load, and `__dirname` does not exist in ESM. Import the migration classes and list them: the same array then works in the CLI, Vitest, and the built app.
 
 The flip side: TypeORM runs only what the array lists. A migration that `migration:generate` wrote but nobody registered is ignored, and `migration:run` prints `No migrations are pending` while the schema is out of date.
 
@@ -489,4 +605,4 @@ Reference: [TypeORM: Migrations](https://typeorm.io/docs/migrations/why)
 
 ---
 
-*Generated by build-agents.ts on 2026-10-29*
+*Generated by build-agents.ts on 2026-10-30*

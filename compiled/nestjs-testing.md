@@ -14,7 +14,7 @@ October 2026
 
 ## Abstract
 
-Testing NestJS apps with Vitest and `@nestjs/testing`. Use when writing unit tests for a provider or controller, e2e tests over HTTP with Supertest, or tests for retries, backoff and work that finishes after the response.
+Testing NestJS apps with Vitest and `@nestjs/testing`. Use when writing unit tests for a provider or controller, e2e tests over HTTP with Supertest (`createTestApp()`, `configureApp()`, per-test database isolation), tests for work that finishes after the response, or tests that exercise existing retry/backoff behaviour on fake timers. To design or configure the retry policy itself, load `nestjs-resilience`.
 
 ---
 
@@ -66,21 +66,23 @@ import { vi } from 'vitest';
 export function autoMock(token?: InjectionToken): Record<string, unknown> {
   const mock: Record<string, unknown> = {};
   if (typeof token !== 'function') return mock;
-  for (let proto = token.prototype; proto && proto !== Object.prototype; proto = Object.getPrototypeOf(proto)) {
+  let proto: unknown = token.prototype;
+  while (typeof proto === 'object' && proto !== null && proto !== Object.prototype) {
     for (const key of Object.getOwnPropertyNames(proto)) {
       if (key !== 'constructor' && !(key in mock)) mock[key] = vi.fn();
     }
+    proto = Object.getPrototypeOf(proto);
   }
   return mock;
 }
 ```
 
 ```typescript
-// src/products/sync.dispatcher.spec.ts
+// src/sync/sync.dispatcher.spec.ts
 import { Test, type TestingModule } from '@nestjs/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { autoMock } from '../../test/auto-mock.js';
-import { SyncService } from '../sync.service.js';
+import { SyncService } from './sync.service.js';
 import { SyncDispatcher } from './sync.dispatcher.js';
 
 describe('SyncDispatcher', () => {
@@ -102,10 +104,19 @@ describe('SyncDispatcher', () => {
 
     expect(sync.sync).toHaveBeenCalledWith('p-1');
   });
+
+  it('settles drain() when the sync itself rejects', async () => {
+    vi.mocked(moduleRef.get(SyncService)).sync.mockRejectedValue(new Error('dead-letter store down'));
+
+    const dispatcher = moduleRef.get(SyncDispatcher);
+    dispatcher.dispatch('p-1');
+
+    await expect(dispatcher.drain()).resolves.toBeUndefined();
+  });
 });
 ```
 
-`autoMock` mocks the methods of class tokens. String and symbol tokens, and methods whose return value the unit calls further, need a specific double (`unit-specific-doubles`). Unit specs sit next to their source as `*.spec.ts`.
+`autoMock` mocks the methods of class tokens. String and symbol tokens, and methods whose return value the unit calls further, need a specific double (`unit-specific-doubles`). Unit specs sit next to their source as `*.spec.ts`. `token.prototype` is `any`; walking it as `unknown` with a type guard keeps `autoMock` clean under `recommendedTypeChecked`, where a `let proto = token.prototype` loop failed `pnpm lint` with ``Unsafe assignment of an `any` value  @typescript-eslint/no-unsafe-assignment``. The `expect(sync.sync)` matchers rely on `unbound-method` being off for test files (`nestjs-setup`, `lint-type-aware-flat-config`).
 
 Reference: [NestJS – Testing: Auto mocking](https://docs.nestjs.com/fundamentals/testing#auto-mocking)
 
@@ -158,7 +169,7 @@ Reference: [NestJS – Testing: Testing request-scoped instances](https://docs.n
 
 **Impact: HIGH** — TypeError from empty mocks, or failures swallowed into a passing-looking undefined
 
-`autoMock` has two gaps. First, it returns `{}` for string and symbol tokens. `@InjectRepository(Product)` is the string token `'ProductRepository'`, so the controller fails with `TypeError: this.products.create is not a function`. Second, every mocked method returns `undefined`. If the unit chains on a return value, such as `this.resilience.preset('downstream').execute(fn)`, the call throws. When the unit's own `catch` turns that error into a dead letter, the test gets `undefined` back and no error at all. For these tokens, write a factory that compares the token, returns the specific double, and passes every other token to `autoMock(token)`. A new constructor parameter then still gets mocked.
+`autoMock` has two gaps. First, it returns `{}` for string and symbol tokens. `@InjectRepository(Product)` is the string token `'ProductRepository'`, so the controller fails with `TypeError: this.products.findOneBy is not a function`. Second, every mocked method returns `undefined`. If the unit chains on a return value, such as `this.resilience.preset('downstream').execute(fn)`, the call throws. When the unit's own `catch` turns that error into a dead letter, the test gets `undefined` back and no error at all. For these tokens, write a factory that compares the token, returns the specific double, and passes every other token to `autoMock(token)`. A new constructor parameter then still gets mocked.
 
 **Incorrect (matches one token and returns `undefined` for the rest):**
 
@@ -166,40 +177,45 @@ Reference: [NestJS – Testing: Testing request-scoped instances](https://docs.n
 const moduleRef = await Test.createTestingModule({ controllers: [ProductsController] })
   .useMocker((token) => {
     if (token === getRepositoryToken(Product)) return products;
-  }) // Nest can't resolve dependencies of the ProductsController (ProductRepository, ?)
+  }) // Nest can't resolve dependencies of the ProductsController (ProductRepository, ?, SyncDispatcher)
   .compile();
 ```
 
 **Correct (specific double for the repository token, `autoMock` for everything else):**
 
 ```typescript
+// src/catalog/products.controller.spec.ts
+import { NotFoundException } from '@nestjs/common';
 import { Test, type TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { autoMock } from '../../test/auto-mock.js';
-import { Product } from '../product.entity.js';
-import { SyncDispatcher } from './sync.dispatcher.js';
+import { SyncDispatcher } from '../sync/sync.dispatcher.js';
+import { Product } from './product.entity.js';
 import { ProductsController } from './products.controller.js';
 
 describe('ProductsController', () => {
-  const products = {
-    create: vi.fn((data: Partial<Product>) => data),
-    save: vi.fn(async (data: Partial<Product>) => ({ id: 'id-1', ...data })),
-  };
+  const products = { findOneBy: vi.fn<(where: Partial<Product>) => Promise<Partial<Product> | null>>() };
   let moduleRef: TestingModule;
 
   beforeEach(async () => {
-    vi.clearAllMocks();
+    products.findOneBy.mockReset();
     moduleRef = await Test.createTestingModule({ controllers: [ProductsController] })
       .useMocker((token) => (token === getRepositoryToken(Product) ? products : autoMock(token)))
       .compile();
   });
 
-  it('saves a new product at version 1', async () => {
-    const created = await moduleRef.get(ProductsController).create({ sku: 'p-1' });
+  it('returns the stored product', async () => {
+    products.findOneBy.mockResolvedValue({ sku: 'p-1', version: 3 });
 
-    expect(created).toEqual({ id: 'id-1', sku: 'p-1', version: 1 });
-    expect(products.save).toHaveBeenCalledOnce();
+    await expect(moduleRef.get(ProductsController).findOne('p-1')).resolves.toEqual({ sku: 'p-1', version: 3 });
+    expect(products.findOneBy).toHaveBeenCalledWith({ sku: 'p-1' });
+  });
+
+  it('answers 404 for an unknown sku', async () => {
+    products.findOneBy.mockResolvedValue(null);
+
+    await expect(moduleRef.get(ProductsController).findOne('p-9')).rejects.toBeInstanceOf(NotFoundException);
   });
 
   it('hands the sync to the dispatcher', () => {
@@ -210,7 +226,7 @@ describe('ProductsController', () => {
 });
 ```
 
-Keep the double in a local `const` so the test uses it with its real type, with no `moduleRef.get<…>(stringToken)` cast. Use the same pattern for a pass-through policy, so a service unit test runs the wrapped call directly:
+The controller reads through `@InjectRepository(Product)`, creates through `ProductService` (auto-mocked here), and dispatches through `SyncDispatcher`. Writes stay out of controllers and repositories: they go through `TransactionRunner` in a service (`nestjs-typeorm`, `orm-atomic-writes`), which the e2e suite covers. Keep the double in a local `const` so the test uses it with its real type, with no `moduleRef.get<…>(stringToken)` cast. Use the same pattern for a pass-through policy, so a service unit test runs the wrapped call directly:
 
 ```typescript
 .useMocker((token) =>
@@ -230,7 +246,9 @@ Reference: [NestJS – Testing: Auto mocking](https://docs.nestjs.com/fundamenta
 
 **Impact: CRITICAL** — E2E tests run without the production validation, error mapping and guards
 
-`createNestApplication()` builds the app from the module graph, and `main.ts` never runs in a test. A pipe, filter, interceptor or guard registered with `app.useGlobal*()` in `main.ts` is missing from every e2e app. In the probe, with `ValidationPipe` only in `main.ts`, `POST /products { sku: 42 }` returned 201 and stored the number. With `APP_PIPE` it returned 400. Copying `app.useGlobalPipes(...)` into each suite tests the copy, which drifts from `main.ts`. Register global enhancers as `APP_PIPE` / `APP_FILTER` / `APP_INTERCEPTOR` / `APP_GUARD` providers in `AppModule`. In that form they can also inject dependencies. App settings that have no provider form, such as `setGlobalPrefix`, `enableCors`, `enableVersioning` and `enableShutdownHooks`, go into one exported `configureApp(app)`. `main.ts` and every e2e suite call it.
+`createNestApplication()` builds the app from the module graph, and `main.ts` never runs in a test. A pipe, filter, interceptor or guard registered with `app.useGlobal*()` in `main.ts` is missing from every e2e app. In the probe, with `ValidationPipe` only in `main.ts`, `POST /api/products { sku: 42 }` returned 201 and stored the number. With `APP_PIPE` it returned 400. Copying `app.useGlobalPipes(...)` into each suite tests the copy, which drifts from `main.ts`. Register global enhancers as `APP_PIPE` / `APP_FILTER` / `APP_INTERCEPTOR` / `APP_GUARD` providers in `AppModule`. In that form they can also inject dependencies.
+
+App settings that have no provider form and that production and tests share, such as `setGlobalPrefix`, `enableCors`, `enableVersioning` and `useStaticAssets`, go into one exported `configureApp(app)`. `main.ts` and `createTestApp()` (`e2e-real-app-module`) call it. Two things stay out of it. `enableShutdownHooks()` belongs to `main.ts` only: a test closes its app with `app.close()`, which runs the same lifecycle hooks, and each open app with shutdown hooks holds its own `SIGTERM` listener (3 open apps, 3 listeners; `close()` removed them). And Express's 100 kb JSON limit stays unless the application needs more.
 
 **Incorrect (enhancers bound in `main.ts`, re-typed in tests):**
 
@@ -247,7 +265,7 @@ app = moduleRef.createNestApplication();
 app.useGlobalPipes(new ValidationPipe()); // a second, already different copy; no filter, no prefix
 ```
 
-**Correct (enhancers in the module graph, the rest in `configureApp`):**
+**Correct (enhancers in the module graph, shared settings in `configureApp`):**
 
 ```typescript
 // src/app.module.ts
@@ -255,40 +273,40 @@ import { Module, ValidationPipe } from '@nestjs/common';
 import { APP_PIPE } from '@nestjs/core';
 
 @Module({
-  imports: [/* TypeOrmModule, ResilienceModule, … */],
-  controllers: [ProductsController],
-  providers: [
-    { provide: APP_PIPE, useValue: new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }) },
-    SyncService,
-    DownstreamClient,
-    SyncDispatcher,
-  ],
+  imports: [/* TypeOrmModule, DatabaseModule, ResilienceModule, CatalogModule, … */],
+  providers: [{ provide: APP_PIPE, useValue: new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }) }],
 })
 export class AppModule {}
 ```
 
 ```typescript
 // src/configure-app.ts
-import type { INestApplication } from '@nestjs/common';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 
-/** App-level settings that have no provider form; main.ts and every e2e suite call this. */
-export function configureApp(app: INestApplication): INestApplication {
-  return app.setGlobalPrefix('api').enableShutdownHooks();
+/** Settings with no provider form that production and tests share; main.ts and createTestApp() call this. */
+export function configureApp(app: NestExpressApplication): NestExpressApplication {
+  return app.setGlobalPrefix('api');
 }
 ```
 
 ```typescript
-// src/main.ts
-import 'reflect-metadata';
-import { NestFactory } from '@nestjs/core';
-import { AppModule } from './app.module.js';
-import { configureApp } from './configure-app.js';
-
-const app = configureApp(await NestFactory.create(AppModule));
+// src/main.ts (excerpt; the full file is nestjs-setup, esm-imports-and-paths)
+const app = await NestFactory.create<NestExpressApplication>(AppModule, { logger });
+configureApp(app);
+app.enableShutdownHooks(); // production only
 await app.listen(process.env.PORT ?? 3000);
 ```
 
-To replace a global enhancer in a suite, such as an auth guard, register it as `{ provide: APP_GUARD, useExisting: ApiKeyGuard }` plus `ApiKeyGuard` as a plain provider. Then `overrideProvider(ApiKeyGuard).useValue({ canActivate: () => true })` replaces it. With `useClass`, the test has no token to override.
+`configureApp` takes `NestExpressApplication` (from `@nestjs/platform-express`), not `INestApplication`, so Express-only settings such as `useBodyParser` and `useStaticAssets` type-check in it. Create the app as `NestFactory.create<NestExpressApplication>()` and `createNestApplication<NestExpressApplication>()` so both call sites type-check. A larger body limit is an application decision, recorded with its reason where it is made:
+
+```typescript
+// Application decision: the bulk import endpoint takes up to 2 MB (PLAN D9).
+app.useBodyParser('json', { limit: '2mb' });
+```
+
+Inside `configureApp`, before `init()`, no `bodyParser: false` is needed: in the probe a 1.2 MB JSON body returned 201 with that line and 413 without it. Called after `init()`, the same line had no effect (413).
+
+To replace a global enhancer in a suite, such as an auth guard, register it as `{ provide: APP_GUARD, useExisting: ApiKeyGuard }` plus `ApiKeyGuard` as a plain provider. Then `createTestApp((builder) => builder.overrideProvider(ApiKeyGuard).useValue({ canActivate: () => true }))` replaces it. With `useClass`, the test has no token to override: in the probe the same override let a denying guard through with `useExisting` (200) and not with `useClass` (403).
 
 Reference: [NestJS – Pipes: Global scoped pipes](https://docs.nestjs.com/pipes#global-scoped-pipes), [NestJS – Testing: Overriding globally registered enhancers](https://docs.nestjs.com/fundamentals/testing#overriding-globally-registered-enhancers)
 
@@ -296,9 +314,13 @@ Reference: [NestJS – Pipes: Global scoped pipes](https://docs.nestjs.com/pipes
 
 ### 2.2 Run E2E Tests Against the Real AppModule Over HTTP
 
-**Impact: CRITICAL** — Green e2e suites that never exercise the real module graph, routes or migrations
+**Impact: CRITICAL** — Green e2e suites that never exercise the real module graph, routes or migrations, or that pass only in one test order
 
-An e2e test shows that the app works once it is wired together: module imports, global enhancers, routes, serialization and migrations. Put each suite in `test/<feature>.e2e-spec.ts` and import the real `AppModule`. Use `overrideProvider()` only for providers that leave the process, such as outbound HTTP clients, message brokers and mailers. In-process providers stay real, and so does the database: every app instance gets a fresh migrated SQLite `:memory:` database (that setup is in `nestjs-typeorm`). `createNestApplication()` does not initialize the app. Call `await app.init()` before the first request, and call `app.close()` in `afterAll` so the connection closes and shutdown hooks run. In ESM, Supertest is a default import. `import * as request from 'supertest'` fails at the first call with `TypeError: (0 , __vite_ssr_import_0__) is not a function`.
+An e2e test shows that the app works once it is wired together: module imports, global enhancers, routes, serialization and migrations. Put each suite in `test/<feature>.e2e-spec.ts` and import the real `AppModule`. Use `overrideProvider()` only for providers that leave the process, such as outbound HTTP clients, message brokers and mailers. In-process providers stay real, and so does the database: every app instance gets a fresh migrated SQLite `:memory:` database (that setup is in `nestjs-typeorm`). `createNestApplication()` does not initialize the app; `await app.init()` runs before the first request, and `app.close()` closes the connection and runs the lifecycle hooks. In ESM, Supertest is a default import. `import * as request from 'supertest'` fails at the first call with `TypeError: (0 , __vite_ssr_import_0__) is not a function`.
+
+Every suite boots through one helper, `createTestApp()`, so no suite forgets `init()` or the settings `main.ts` applies. Other skills extend it through its two parameters instead of building their own app: `override` receives the `TestingModuleBuilder` (provider overrides such as an HTTP client double or parked timers), and `options.logger` replaces Nest's logger (a capturing logger from `nestjs-logging`, or `false`).
+
+Each test gets its own app. A database that is fresh per app is not fresh per test when the app is created in `beforeAll`: in the probe, a suite of 30 tests that each create product `p-1` passed the first test and failed the other 29 with `expected 201 "Created", got 409 "Conflict"`. With the app created in `beforeEach`, all 30 passed. The cost is one boot per test: with 12 migrations and 500 seeded rows, `createTestApp()` plus `close()` took 5.3 ms (median of 30), and the 30-test suite ran in 894 ms against 703 ms for one shared app. A deterministic reset (delete every entity table inside `TransactionRunner.run()` before each test) ran it in 648 ms, but it has to know every table, has to re-seed what migrations inserted, and leaves provider state alive: circuit breakers, dispatcher queues and caches carry over between tests. Use the app per test; switch a suite to a reset only when its boot measurably dominates, and then reset that state too.
 
 **Incorrect (hand-assembled module, mocked internals, namespace import, no lifecycle):**
 
@@ -315,37 +337,80 @@ const moduleRef = await Test.createTestingModule({
 const app = moduleRef.createNestApplication(); // no init(), never closed
 ```
 
-**Correct (real `AppModule`, outbound client overridden):**
+**Incorrect (one app, and one database, for the whole suite):**
+
+```typescript
+beforeAll(async () => {
+  app = await createTestApp();
+});
+afterAll(() => app.close());
+// the second test that creates p-1 gets 409: the first test's row is still there
+```
+
+**Correct (`test/support/test-app.ts`, one boot path for every suite):**
+
+```typescript
+import type { LoggerService } from '@nestjs/common';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import { Test, type TestingModuleBuilder } from '@nestjs/testing';
+import { AppModule } from '../../src/app.module.js';
+import { configureApp } from '../../src/configure-app.js';
+
+export interface TestAppOptions {
+  /** App logger, e.g. a capturing logger (nestjs-logging); `false` silences Nest's output. */
+  logger?: LoggerService | false;
+}
+
+/** Boots the real AppModule with main.ts's app settings. `override` replaces outbound boundaries only. */
+export async function createTestApp(
+  override: (builder: TestingModuleBuilder) => TestingModuleBuilder = (builder) => builder,
+  options: TestAppOptions = {},
+): Promise<NestExpressApplication> {
+  const moduleRef = await override(Test.createTestingModule({ imports: [AppModule] })).compile();
+  const app = moduleRef.createNestApplication<NestExpressApplication>(
+    options.logger === undefined ? {} : { logger: options.logger },
+  );
+  try {
+    configureApp(app);
+    await app.init();
+  } catch (error) {
+    // No teardown is registered for an app that never returned: close what init() opened, report the boot error.
+    await app.close().catch(() => undefined);
+    throw error;
+  }
+  return app;
+}
+```
+
+**Correct (real `AppModule`, outbound client overridden, one app per test):**
 
 ```typescript
 // test/products.e2e-spec.ts
-import type { INestApplication } from '@nestjs/common';
-import { Test } from '@nestjs/testing';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { AppModule } from '../src/app.module.js';
-import { configureApp } from '../src/configure-app.js';
-import { DownstreamClient } from '../src/downstream.client.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { DownstreamClient } from '../src/sync/downstream.client.js';
+import { createTestApp } from './support/test-app.js';
 
 describe('Products (e2e)', () => {
-  const downstream = { push: vi.fn(async (id: string) => `ok:${id}`) };
-  let app: INestApplication;
+  const downstream = { push: vi.fn((id: string) => Promise.resolve(`ok:${id}`)) };
+  let app: NestExpressApplication;
 
-  beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
-      .overrideProvider(DownstreamClient)
-      .useValue(downstream)
-      .compile();
-    app = configureApp(moduleRef.createNestApplication());
-    await app.init();
+  // A fresh app per test: its own migrated :memory: database and fresh provider state.
+  beforeEach(async () => {
+    app = await createTestApp((builder) => builder.overrideProvider(DownstreamClient).useValue(downstream));
+    return () => app.close();
   });
-
-  afterAll(() => app.close());
 
   it('POST /api/products stores the product', async () => {
     const res = await request(app.getHttpServer()).post('/api/products').send({ sku: 'p-1' }).expect(201);
 
     expect(res.body).toMatchObject({ sku: 'p-1', version: 1 });
+  });
+
+  it('POST /api/products answers 409 for a duplicate sku', async () => {
+    await request(app.getHttpServer()).post('/api/products').send({ sku: 'p-1' }).expect(201);
+    await request(app.getHttpServer()).post('/api/products').send({ sku: 'p-1' }).expect(409);
   });
 
   it('POST /api/products rejects an invalid body', async () => {
@@ -354,9 +419,11 @@ describe('Products (e2e)', () => {
 });
 ```
 
-The 400 comes from the `ValidationPipe` that `AppModule` registers. `configureApp()` applies the global prefix that `main.ts` also uses (`e2e-global-enhancers-as-providers`).
+The function `beforeEach` returns is Vitest's teardown for that test. It is registered only once the app exists: when a provider factory threw during boot, the returned-teardown suite reported only `Error: boot failed`, while a separate `afterEach(() => app.close())` added `TypeError: Cannot read properties of undefined (reading 'close')`. A boot that fails after the app is created is therefore closed inside `createTestApp()`: with a provider whose `onModuleInit` started an interval and then threw, the test still saw the original `boot failed in onModuleInit`, and the provider's `onModuleDestroy` ran and the `DataSource` was closed; without the `catch`, neither happened. The 400 comes from the `ValidationPipe` that `AppModule` registers; `configureApp()` applies the global prefix that `main.ts` also uses (`e2e-global-enhancers-as-providers`). The 409 comes from the unique-constraint mapping in `nestjs-typeorm` (`orm-unique-violation`). With `{ logger: capture }`, the capturing logger received `Nest application successfully started` from `init()`.
 
-Reference: [NestJS – Testing: End-to-end testing](https://docs.nestjs.com/fundamentals/testing#end-to-end-testing)
+For an HTTP dependency, `DownstreamClient` is the system's client provider that wraps a `@nestjs/http-client` client; how to register it, and how to test the client itself against a stubbed transport, is in `nestjs-http-client` (`test-override-client-provider`, `test-mock-agent-dispatcher`).
+
+Reference: [NestJS – Testing: End-to-end testing](https://docs.nestjs.com/fundamentals/testing#end-to-end-testing), [Vitest – beforeEach](https://vitest.dev/api/#beforeeach)
 
 ---
 
@@ -381,19 +448,27 @@ expect(downstream.push).toHaveBeenCalledWith('p-1');
 **Correct (the dispatcher tracks its work; the test awaits `drain()`):**
 
 ```typescript
-// src/products/sync.dispatcher.ts
-import { Injectable } from '@nestjs/common';
-import { SyncService } from '../sync.service.js';
+// src/sync/sync.dispatcher.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { SyncService } from './sync.service.js';
 
 @Injectable()
 export class SyncDispatcher {
+  private readonly logger = new Logger(SyncDispatcher.name);
   private readonly pending = new Set<Promise<unknown>>();
 
   constructor(private readonly sync: SyncService) {}
 
   /** Fire-and-forget: the HTTP response does not wait for the sync. */
   dispatch(id: string): void {
-    const job = this.sync.sync(id).finally(() => this.pending.delete(job));
+    const job = this.sync
+      .sync(id)
+      .catch((error: unknown) => {
+        // sync() dead-letters final failures; this catches the dead-letter write failing too.
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.logger.error('Product sync lost, dead letter not recorded', { productId: id }, err);
+      })
+      .finally(() => this.pending.delete(job));
     this.pending.add(job);
   }
 
@@ -405,8 +480,23 @@ export class SyncDispatcher {
 ```
 
 ```typescript
-// test/sync-dispatch.e2e-spec.ts (app built as in e2e-real-app-module)
-it('POST /api/products/:id/sync pushes after the 202', async () => {
+// test/sync-dispatch.e2e-spec.ts
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import request from 'supertest';
+import { DownstreamClient } from '../src/sync/downstream.client.js';
+import { SyncDispatcher } from '../src/sync/sync.dispatcher.js';
+import { createTestApp } from './support/test-app.js';
+
+const downstream = { push: vi.fn((id: string) => Promise.resolve(`ok:${id}`)) };
+let app: NestExpressApplication;
+
+beforeEach(async () => {
+  downstream.push.mockClear();
+  app = await createTestApp((builder) => builder.overrideProvider(DownstreamClient).useValue(downstream));
+  return () => app.close();
+});
+
+it('POST /api/products/:sku/sync pushes after the 202', async () => {
   await request(app.getHttpServer()).post('/api/products/p-1/sync').expect(202);
 
   await app.get(SyncDispatcher).drain();
@@ -416,7 +506,7 @@ it('POST /api/products/:id/sync pushes after the 202', async () => {
 
 it('drain() combines with fake timers when the side effect retries', async () => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
-  downstream.push.mockClear().mockRejectedValueOnce(Object.assign(new Error('unavailable'), { status: 503 }));
+  downstream.push.mockRejectedValueOnce(Object.assign(new Error('unavailable'), { status: 503 }));
 
   await request(app.getHttpServer()).post('/api/products/p-2/sync').expect(202);
   const drained = app.get(SyncDispatcher).drain();
@@ -428,7 +518,7 @@ it('drain() combines with fake timers when the side effect retries', async () =>
 });
 ```
 
-The `while` loop also waits for work that is dispatched while `drain()` is already running. `SyncService.sync()` never rejects, because it records a dead letter instead. That keeps the fire-and-forget promise from becoming an unhandled rejection.
+The `while` loop also waits for work that is dispatched while `drain()` is already running. `sync()` records final failures as dead letters, but that write can fail too (`nestjs-resilience`, `dlq-record-final-failure`), so every dispatched promise ends in the `.catch`. Tests that call `drain()` do not reveal a missing `.catch`, because `Promise.allSettled` handles the rejection: without it, a spec that dispatched and drained passed cleanly, and one that dispatched without draining, like production, ended with Vitest's `Unhandled Rejection` error; in the app, `main.ts`'s handler would log it as fatal and exit. With the `.catch`, both specs passed. The log follows `nestjs-logging`: a fixed message, fields, the `Error` as the third argument, at `error` because the work is lost.
 
 Reference: [NestJS – Testing: End-to-end testing](https://docs.nestjs.com/fundamentals/testing#end-to-end-testing)
 
@@ -438,7 +528,9 @@ Reference: [NestJS – Testing: End-to-end testing](https://docs.nestjs.com/fund
 
 **Impact: MEDIUM-HIGH** — Seconds of real waiting per test, and flaky results from random jitter
 
-Retry code waits between attempts. In the probe, the production preset (`attempts: 3`, `backoff: { delay: '1s' }`, full jitter by default) cost 2.7 s of real time per test. On fake timers the same test took 2 ms. In beforeEach, call `vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })`. `@nestjs/resilience` 0.0.3 waits through the global `setTimeout`, and its circuit breakers and rate limits read `Date.now()`. Start the call without awaiting it, then `await vi.advanceTimersByTimeAsync(ms)` past the full backoff budget, then await the result. The async variant lets each failed attempt settle before the next timer fires. `vi.waitFor` does not speed up fake time. Under fake timers it moves the clock forward by `interval` (50 ms) once per real `interval`. With its 1 s default timeout it saw 2 of the 3 attempts and failed. Use it only to poll for work that finishes quickly in real time.
+Retry code waits between attempts. In the probe, a call that failed twice under the production preset (`attempts: 3`, `backoff: { delay: '1s' }`, full jitter by default) took 430 to 711 ms of real time across three runs, a different figure every run. On fake timers the same call took 1.3 ms. Boot the app first, then call `vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })` in `beforeEach`. `@nestjs/resilience` 0.0.3 waits through the global `setTimeout`, and its circuit breakers and rate limits read `Date.now()`. Start the call without awaiting it, then `await vi.advanceTimersByTimeAsync(ms)` past the full backoff budget, then await the result. The async variant lets each failed attempt settle before the next timer fires. `vi.waitFor` does not speed up fake time. Under fake timers it moves the clock forward by `interval` (50 ms) once per real `interval`. With its 1 s default timeout it saw 2 of the 3 attempts and failed. Use it only to poll for work that finishes quickly in real time.
+
+This tests retry behaviour the application already has. Which errors retry, how often and with which backoff is designed in `nestjs-resilience`.
 
 **Incorrect (real backoff, or a sleep that guesses it):**
 
@@ -454,30 +546,21 @@ it('retries a transient failure', async () => {
 **Correct (production preset, fake clock advanced past the backoff):**
 
 ```typescript
-import type { INestApplication } from '@nestjs/common';
-import { Test } from '@nestjs/testing';
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
-import { AppModule } from '../src/app.module.js';
-import { DownstreamClient } from '../src/downstream.client.js';
-import { SyncService } from '../src/sync.service.js';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { DownstreamClient } from '../src/sync/downstream.client.js';
+import { SyncService } from '../src/sync/sync.service.js';
+import { createTestApp } from './support/test-app.js';
 
 const unavailable = () => Object.assign(new Error('unavailable'), { status: 503 });
 const downstream = { push: vi.fn<(id: string) => Promise<string>>() };
-let app: INestApplication;
+let app: NestExpressApplication;
 
-beforeAll(async () => {
-  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
-    .overrideProvider(DownstreamClient)
-    .useValue(downstream)
-    .compile();
-  app = moduleRef.createNestApplication();
-  await app.init();
-});
-afterAll(() => app.close());
-
-beforeEach(() => {
+beforeEach(async () => {
   downstream.push.mockReset();
+  app = await createTestApp((builder) => builder.overrideProvider(DownstreamClient).useValue(downstream));
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  return () => app.close();
 });
 afterEach(() => vi.useRealTimers());
 
@@ -503,20 +586,25 @@ it('dead-letters after the last attempt', async () => {
 });
 ```
 
+The app per test (`e2e-real-app-module`) also gives each test fresh circuit-breaker state, so a test that opens the breaker cannot fail the next one.
+
 **Correct (alternative when the test is about something other than the retry timing: zero backoff):**
 
 ```typescript
 import { RESILIENCE_MODULE_OPTIONS, type ResilienceModuleOptions } from '@nestjs/resilience';
 
-const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
-  .overrideProvider(DownstreamClient)
-  .useValue(downstream)
-  .overrideProvider(RESILIENCE_MODULE_OPTIONS)
-  .useValue({ presets: { downstream: { retry: { attempts: 3, backoff: { delay: 0 } } } } } satisfies ResilienceModuleOptions)
-  .compile();
+app = await createTestApp((builder) =>
+  builder
+    .overrideProvider(DownstreamClient)
+    .useValue(downstream)
+    .overrideProvider(RESILIENCE_MODULE_OPTIONS)
+    .useValue({
+      presets: { downstream: { retry: { attempts: 3, backoff: { delay: 0 } } } },
+    } satisfies ResilienceModuleOptions),
+);
 ```
 
-This works with `@nestjs/resilience` 0.0.3 and real timers: a call that failed twice and succeeded on the third attempt finished in 4 ms. `useValue` replaces the whole options object, including every preset and `defaults`, so the test no longer checks the production policy. Prefer fake timers whenever the attempt count, backoff or breaker behaviour is what you are testing.
+This works with `@nestjs/resilience` 0.0.3 and real timers: a call that failed twice and succeeded on the third attempt finished in 5.1 ms. `useValue` replaces the whole options object, including every preset and `defaults`, so the test no longer checks the production policy. Prefer fake timers whenever the attempt count, backoff or breaker behaviour is what you are testing.
 
 Reference: [Vitest – vi.useFakeTimers](https://vitest.dev/api/vi#vi-usefaketimers), [Vitest – vi.advanceTimersByTimeAsync](https://vitest.dev/api/vi#vi-advancetimersbytimeasync)
 
@@ -532,4 +620,4 @@ Reference: [Vitest – vi.useFakeTimers](https://vitest.dev/api/vi#vi-usefaketim
 
 ---
 
-*Generated by build-agents.ts on 2026-10-29*
+*Generated by build-agents.ts on 2026-10-30*

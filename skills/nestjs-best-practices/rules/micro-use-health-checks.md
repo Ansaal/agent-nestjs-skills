@@ -7,220 +7,146 @@ tags: microservices, health-checks, terminus, kubernetes
 
 ## Implement Health Checks for Microservices
 
-Implement liveness and readiness probes using `@nestjs/terminus`. Liveness checks determine if the service should be restarted. Readiness checks determine if the service can accept traffic. Proper health checks enable Kubernetes and load balancers to route traffic correctly.
+Expose liveness and readiness with `@nestjs/terminus`. Liveness answers "is the process stuck?" and restarts the container when it fails, so it checks no dependencies: a database outage that fails liveness restarts every pod at once and fixes nothing. Readiness answers "can this instance serve traffic now?" and checks the dependencies every request needs, each with a timeout shorter than the probe's. Check each dependency with its own protocol: Redis speaks RESP, so `HttpHealthIndicator.pingCheck('redis', 'http://redis:6379')` fails against a healthy server; use the Redis client's `PING`. Keep third-party APIs out of readiness: their outage would take every instance out of the load balancer while the endpoints that don't need them could still serve.
 
-**Incorrect (simple ping that doesn't check dependencies):**
+**Incorrect (static OK; Redis probed over HTTP; dependencies in liveness):**
 
 ```typescript
-// Simple ping that doesn't check dependencies
-@Controller('health')
-export class HealthController {
-  @Get()
-  check(): string {
-    return 'OK'; // Service might be unhealthy but returns OK
-  }
+@Get('health')
+check(): string {
+  return 'OK'; // 200 while the database is unreachable
 }
 
-// Health check that blocks on slow dependencies
-@Controller('health')
-export class HealthController {
-  @Get()
-  async check(): Promise<string> {
-    // If database is slow, health check times out
-    await this.userRepo.findOne({ where: { id: '1' } });
-    await this.redis.ping();
-    await this.externalApi.healthCheck();
-    return 'OK';
+@Get('live')
+@HealthCheck()
+liveness() {
+  return this.health.check([() => this.db.pingCheck('database')]); // a DB outage restarts every pod
+}
+
+@Get('ready')
+@HealthCheck()
+readiness() {
+  return this.health.check([
+    () => this.http.pingCheck('redis', 'http://redis:6379'), // not HTTP: always down
+    () => this.http.pingCheck('payments', 'https://api.payments.example/health'), // a third party's outage drains you
+  ]);
+}
+```
+
+**Correct (`health/redis.health.ts`):**
+
+```typescript
+import { Injectable } from '@nestjs/common';
+import { HealthIndicatorService } from '@nestjs/terminus';
+import { Redis } from 'ioredis';
+
+/** Redis speaks RESP, not HTTP: check it with the client's own PING. */
+@Injectable()
+export class RedisHealthIndicator {
+  constructor(
+    private readonly redis: Redis,
+    private readonly health: HealthIndicatorService,
+  ) {}
+
+  pingCheck(key: string) {
+    return this.health
+      .check(key)
+      .attempt(async () => {
+        await this.redis.ping();
+      })
+      .withTimeout(1000);
   }
 }
 ```
 
-**Correct (use @nestjs/terminus for comprehensive health checks):**
+**Correct (`health/health.controller.ts`):**
 
 ```typescript
-// Use @nestjs/terminus for comprehensive health checks
-import {
-  HealthCheckService,
-  HttpHealthIndicator,
-  TypeOrmHealthIndicator,
-  HealthCheck,
-  DiskHealthIndicator,
-  MemoryHealthIndicator,
-} from '@nestjs/terminus';
+import { Controller, Get } from '@nestjs/common';
+import { HealthCheck, HealthCheckService, TypeOrmHealthIndicator } from '@nestjs/terminus';
+import { RedisHealthIndicator } from './redis.health.js';
 
 @Controller('health')
 export class HealthController {
   constructor(
-    private health: HealthCheckService,
-    private http: HttpHealthIndicator,
-    private db: TypeOrmHealthIndicator,
-    private disk: DiskHealthIndicator,
-    private memory: MemoryHealthIndicator,
+    private readonly health: HealthCheckService,
+    private readonly db: TypeOrmHealthIndicator,
+    private readonly redis: RedisHealthIndicator,
   ) {}
 
-  // Liveness probe - is the service alive?
+  /** Liveness: the process answers. No dependencies, or one outage restarts every pod at once. */
   @Get('live')
   @HealthCheck()
   liveness() {
-    return this.health.check([
-      // Basic checks only
-      () => this.memory.checkHeap('memory_heap', 200 * 1024 * 1024), // 200MB
-    ]);
+    return this.health.check([]);
   }
 
-  // Readiness probe - can the service handle traffic?
+  /** Readiness: can this instance serve traffic right now? */
   @Get('ready')
   @HealthCheck()
   readiness() {
     return this.health.check([
-      () => this.db.pingCheck('database'),
-      () =>
-        this.http.pingCheck('redis', 'http://redis:6379', { timeout: 1000 }),
-      () =>
-        this.disk.checkStorage('disk', { path: '/', thresholdPercent: 0.9 }),
+      () => this.db.pingCheck('database').withTimeout(1000),
+      () => this.redis.pingCheck('redis'),
     ]);
   }
-
-  // Deep health check for debugging
-  @Get('deep')
-  @HealthCheck()
-  deepCheck() {
-    return this.health.check([
-      () => this.db.pingCheck('database'),
-      () => this.memory.checkHeap('memory_heap', 200 * 1024 * 1024),
-      () => this.memory.checkRSS('memory_rss', 300 * 1024 * 1024),
-      () =>
-        this.disk.checkStorage('disk', { path: '/', thresholdPercent: 0.9 }),
-      () =>
-        this.http.pingCheck('external-api', 'https://api.example.com/health'),
-    ]);
-  }
-}
-
-// Custom indicator for business-specific health
-@Injectable()
-export class QueueHealthIndicator extends HealthIndicator {
-  constructor(private queueService: QueueService) {
-    super();
-  }
-
-  async isHealthy(key: string): Promise<HealthIndicatorResult> {
-    const queueStats = await this.queueService.getStats();
-
-    const isHealthy = queueStats.failedCount < 100;
-    const result = this.getStatus(key, isHealthy, {
-      waiting: queueStats.waitingCount,
-      active: queueStats.activeCount,
-      failed: queueStats.failedCount,
-    });
-
-    if (!isHealthy) {
-      throw new HealthCheckError('Queue unhealthy', result);
-    }
-
-    return result;
-  }
-}
-
-// Redis health indicator
-@Injectable()
-export class RedisHealthIndicator extends HealthIndicator {
-  constructor(@InjectRedis() private redis: Redis) {
-    super();
-  }
-
-  async isHealthy(key: string): Promise<HealthIndicatorResult> {
-    try {
-      const pong = await this.redis.ping();
-      return this.getStatus(key, pong === 'PONG');
-    } catch (error) {
-      throw new HealthCheckError('Redis check failed', this.getStatus(key, false));
-    }
-  }
-}
-
-// Use custom indicators
-@Get('ready')
-@HealthCheck()
-readiness() {
-  return this.health.check([
-    () => this.db.pingCheck('database'),
-    () => this.redis.isHealthy('redis'),
-    () => this.queue.isHealthy('job-queue'),
-  ]);
-}
-
-// Graceful shutdown handling
-@Injectable()
-export class GracefulShutdownService implements OnApplicationShutdown {
-  private isShuttingDown = false;
-
-  isShutdown(): boolean {
-    return this.isShuttingDown;
-  }
-
-  async onApplicationShutdown(signal: string): Promise<void> {
-    this.isShuttingDown = true;
-    console.log(`Shutting down on ${signal}`);
-
-    // Wait for in-flight requests
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-  }
-}
-
-// Health check respects shutdown state
-@Get('ready')
-@HealthCheck()
-readiness() {
-  if (this.shutdownService.isShutdown()) {
-    throw new ServiceUnavailableException('Shutting down');
-  }
-
-  return this.health.check([
-    () => this.db.pingCheck('database'),
-  ]);
 }
 ```
+
+**Correct (`health/health.module.ts`):**
+
+```typescript
+import { Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { TerminusModule } from '@nestjs/terminus';
+import type { Env } from '../config/env.validation.js';
+import { HealthController } from './health.controller.js';
+import { RedisHealthIndicator } from './redis.health.js';
+
+@Module({
+  imports: [
+    TerminusModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService<Env, true>) => ({
+        // On SIGTERM: every health check answers 503 "shutting_down", then shutdown waits this long
+        gracefulShutdownTimeoutMs: config.get('SHUTDOWN_DRAIN_MS', { infer: true }),
+      }),
+    }),
+  ],
+  controllers: [HealthController],
+  providers: [RedisHealthIndicator],
+})
+export class HealthModule {}
+```
+
+`Redis` is the shared client from `perf-async-hooks`. Custom indicators use `HealthIndicatorService`: `@nestjs/terminus` 12.1.0 no longer exports the `HealthIndicator` base class or `HealthCheckError` that older examples extend and throw. `check(key).attempt(fn).withTimeout(ms)` marks the key `down` when `fn` throws or runs past the timeout; the built-in indicators return the same attempt, and `pingCheck(key, { timeout })` is deprecated in 12.1.0 in favour of `.withTimeout(ms)`. `SHUTDOWN_DRAIN_MS` is a validated `Env` key (`Joi.number().integer().min(0).default(10_000)`, `devops-use-config-module`): `abc` stopped startup with `Config validation error: SHUTDOWN_DRAIN_MS: "SHUTDOWN_DRAIN_MS" must be a number`, and unset it drained 10000 ms. In the probe (better-sqlite3 database, Redis 8.10.2), `/health/ready` returned 200 with `{"database":{"status":"up"},"redis":{"status":"up"}}` (plus `responseTime`); against a stub that answered `PING` after 3 s it returned 503 after 1022 ms with `{"redis":{"message":"timeout of 1000ms exceeded","responseTime":1003,"status":"down"}}`. `gracefulShutdownTimeoutMs` turns both endpoints into 503 `shutting_down` on `SIGTERM`; the shutdown sequence is `devops-graceful-shutdown`.
 
 ### Kubernetes Configuration
 
 ```yaml
-# Kubernetes deployment with probes
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: api-service
 spec:
   template:
     spec:
+      terminationGracePeriodSeconds: 30 # > SHUTDOWN_DRAIN_MS + the longest request
       containers:
         - name: api
-          image: api-service:latest
+          image: api-service:1.4.2
           ports:
             - containerPort: 3000
+          startupProbe:
+            httpGet: { path: /health/live, port: 3000 }
+            periodSeconds: 5
+            failureThreshold: 30
           livenessProbe:
-            httpGet:
-              path: /health/live
-              port: 3000
-            initialDelaySeconds: 30
+            httpGet: { path: /health/live, port: 3000 }
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
-            httpGet:
-              path: /health/ready
-              port: 3000
-            initialDelaySeconds: 5
+            httpGet: { path: /health/ready, port: 3000 }
             periodSeconds: 5
-            timeoutSeconds: 3
-            failureThreshold: 3
-          startupProbe:
-            httpGet:
-              path: /health/live
-              port: 3000
-            initialDelaySeconds: 0
-            periodSeconds: 5
-            failureThreshold: 30
+            timeoutSeconds: 3 # above the 1 s indicator timeouts
+            failureThreshold: 2
 ```
 
 Reference: [NestJS Terminus](https://docs.nestjs.com/recipes/terminus)

@@ -1,18 +1,17 @@
 ---
-title: Implement Secure JWT Authentication
+title: Issue and Verify Short-Lived JWT Access Tokens
 impact: CRITICAL
-impactDescription: Essential for secure APIs
-tags: security, jwt, authentication, tokens
+impactDescription: Forged, stale or over-privileged tokens accepted
+tags: security, jwt, authentication, tokens, passport
 ---
 
-## Implement Secure JWT Authentication
+## Issue and Verify Short-Lived JWT Access Tokens
 
-Use `@nestjs/jwt` with `@nestjs/passport` for authentication. Store secrets securely, use appropriate token lifetimes, implement refresh tokens, and validate tokens properly. Never expose sensitive data in JWT payloads.
+Use `@nestjs/jwt` to sign access tokens and `@nestjs/passport` with `passport-jwt` to verify them. Read every required setting with `ConfigService.getOrThrow()`, so a missing secret stops the app at startup instead of failing at the first `sign()`; `get()` returns `undefined`, and an `undefined` issuer or audience silently turns that check off. Keep tokens short-lived and the payload to identifiers. `JwtStrategy.validate()` loads the user on every request, so deactivation, demotion and "sign out everywhere" take effect immediately. This rule covers access tokens only. Refresh tokens need their own atomic rotation contract (hashed one-time secrets, expiry and revocation checks, single-use replacement, family revocation on reuse); a `save()` of a hashed random string is not one, so don't issue refresh tokens until you implement that contract in full.
 
-**Incorrect (insecure JWT implementation):**
+**Incorrect (hardcoded secret, sensitive payload, no user check):**
 
 ```typescript
-// Hardcode secrets
 @Module({
   imports: [
     JwtModule.register({
@@ -23,25 +22,21 @@ Use `@nestjs/jwt` with `@nestjs/passport` for authentication. Store secrets secu
 })
 export class AuthModule {}
 
-// Store sensitive data in JWT
 async login(user: User): Promise<{ accessToken: string }> {
   const payload = {
     sub: user.id,
-    email: user.email,
-    password: user.password, // NEVER include password!
-    ssn: user.ssn, // NEVER include sensitive data!
-    isAdmin: user.isAdmin, // Can be tampered if not verified
+    email: user.email, // personal data, readable by anyone holding the token
+    roles: user.roles, // stays valid after the user is demoted
   };
   return { accessToken: this.jwtService.sign(payload) };
 }
 
-// Skip token validation
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
-  constructor() {
+  constructor(config: ConfigService) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-      secretOrKey: 'my-secret',
+      secretOrKey: config.get('JWT_SECRET'), // undefined when unset; issuer/audience never checked
     });
   }
 
@@ -51,96 +46,105 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 }
 ```
 
-**Correct (secure JWT with refresh tokens):**
+**Correct (validated settings, identifier-only payload, user loaded per request):**
 
 ```typescript
-// Secure JWT configuration
+// auth/auth.module.ts
+import { Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { JwtModule } from '@nestjs/jwt';
+import { PassportModule } from '@nestjs/passport';
+import { UsersModule } from '../users/users.module.js';
+import { AuthService } from './auth.service.js';
+import { JwtStrategy } from './jwt.strategy.js';
+
 @Module({
   imports: [
+    UsersModule,
+    PassportModule,
     JwtModule.registerAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
+      inject: [ConfigService], // ConfigModule.forRoot({ isGlobal: true }) in AppModule
       useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_SECRET'),
+        secret: config.getOrThrow<string>('JWT_SECRET'),
         signOptions: {
+          algorithm: 'HS256',
           expiresIn: '15m', // Short-lived access tokens
-          issuer: config.get<string>('JWT_ISSUER'),
-          audience: config.get<string>('JWT_AUDIENCE'),
+          issuer: config.getOrThrow<string>('JWT_ISSUER'),
+          audience: config.getOrThrow<string>('JWT_AUDIENCE'),
         },
       }),
     }),
-    PassportModule.register({ defaultStrategy: 'jwt' }),
   ],
+  providers: [AuthService, JwtStrategy],
+  exports: [AuthService],
 })
 export class AuthModule {}
+```
 
-// Minimal JWT payload
-@Injectable()
-export class AuthService {
-  async login(user: User): Promise<TokenResponse> {
-    // Only include necessary, non-sensitive data
-    const payload: JwtPayload = {
-      sub: user.id,
-      email: user.email,
-      roles: user.roles,
-      iat: Math.floor(Date.now() / 1000),
-    };
-
-    const accessToken = this.jwtService.sign(payload);
-    const refreshToken = await this.createRefreshToken(user.id);
-
-    return { accessToken, refreshToken, expiresIn: 900 };
-  }
-
-  private async createRefreshToken(userId: string): Promise<string> {
-    const token = randomBytes(32).toString('hex');
-    const hashedToken = await bcrypt.hash(token, 10);
-
-    await this.refreshTokenRepo.save({
-      userId,
-      token: hashedToken,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
-    });
-
-    return token;
-  }
+```typescript
+// auth/auth.service.ts
+/** Identifiers only: no roles, no personal data. Roles are read from the database per request. */
+export interface AccessTokenPayload {
+  sub: string;
+  ver: number;
 }
 
-// Proper JWT strategy with validation
 @Injectable()
-export class JwtStrategy extends PassportStrategy(Strategy) {
-  constructor(
-    private config: ConfigService,
-    private usersService: UsersService,
-  ) {
-    super({
-      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-      secretOrKey: config.get<string>('JWT_SECRET'),
-      ignoreExpiration: false,
-      issuer: config.get<string>('JWT_ISSUER'),
-      audience: config.get<string>('JWT_AUDIENCE'),
-    });
-  }
+export class AuthService {
+  constructor(private readonly jwt: JwtService) {}
 
-  async validate(payload: JwtPayload): Promise<User> {
-    // Verify user still exists and is active
-    const user = await this.usersService.findById(payload.sub);
-
-    if (!user || !user.isActive) {
-      throw new UnauthorizedException('User not found or inactive');
-    }
-
-    // Verify token wasn't issued before password change
-    if (user.passwordChangedAt) {
-      const tokenIssuedAt = new Date(payload.iat * 1000);
-      if (tokenIssuedAt < user.passwordChangedAt) {
-        throw new UnauthorizedException('Token invalidated by password change');
-      }
-    }
-
-    return user;
+  /** Call only after the credentials have been verified. */
+  async issueAccessToken(user: User): Promise<{ accessToken: string; expiresIn: number }> {
+    const payload: AccessTokenPayload = { sub: user.id, ver: user.tokenVersion };
+    return { accessToken: await this.jwt.signAsync(payload), expiresIn: 900 };
   }
 }
 ```
 
-Reference: [NestJS Authentication](https://docs.nestjs.com/security/authentication)
+```typescript
+// users/users.repository.ts (arch-use-repository-pattern): the read that authorizes
+/** Committed state only: waits behind an open transaction instead of reading its uncommitted rows. */
+findCommittedById(id: string): Promise<User | null> {
+  return this.transactions.run((manager) => manager.findOneBy(User, { id }));
+}
+```
+
+```typescript
+// auth/jwt.strategy.ts
+import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PassportStrategy } from '@nestjs/passport';
+import { ExtractJwt, Strategy } from 'passport-jwt';
+import { UsersRepository } from '../users/users.repository.js';
+import type { AccessTokenPayload } from './auth.service.js';
+import type { AuthenticatedUser } from './authenticated-request.js';
+
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy) {
+  constructor(
+    config: ConfigService,
+    private readonly users: UsersRepository,
+  ) {
+    super({
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      secretOrKey: config.getOrThrow<string>('JWT_SECRET'),
+      issuer: config.getOrThrow<string>('JWT_ISSUER'),
+      audience: config.getOrThrow<string>('JWT_AUDIENCE'),
+      algorithms: ['HS256'],
+    });
+  }
+
+  /** Runs after the signature and expiry check; its return value becomes request.user. */
+  async validate(payload: AccessTokenPayload): Promise<AuthenticatedUser> {
+    // Committed read: a role change inside another request's open transaction is not visible until it commits
+    const user = await this.users.findCommittedById(payload.sub);
+    // Deleted, deactivated, or signed out everywhere (tokenVersion bumped) since the token was issued
+    if (!user?.isActive || user.tokenVersion !== payload.ver) throw new UnauthorizedException();
+    return { id: user.id, roles: user.roles, plan: user.plan };
+  }
+}
+```
+
+Without `JWT_SECRET`, `main.ts` stopped during `NestFactory.create` with `{"level":"error",…,"message":"Configuration key \"JWT_SECRET\" does not exist","context":"ExceptionHandler",…}` and exit code 1. `validate()` decides authorization, so it reads through `TransactionRunner.run()` (`nestjs-typeorm` rule `orm-atomic-writes`): a plain repository read on better-sqlite3 runs inside whatever transaction is open on the shared connection. In the probe, a member's token called an `@Roles(['admin'])` route while another transaction had set the user's roles to `['admin']` and then rolled back: with `findById` the request answered 200, with `findCommittedById` it waited for the rollback and answered 403. `tokenVersion` is an integer column incremented on password change, "sign out everywhere" and account recovery; comparing it is exact, where comparing `iat` (whole seconds) with a password-change timestamp misjudges tokens issued in the same second. `AuthenticatedUser` and the global `JwtAuthGuard` that runs this strategy are in `security-use-guards`. Secrets come from the environment or a secret manager, never from source; for HS256 use at least 32 random bytes.
+
+Reference: [NestJS Authentication: Passport JWT](https://docs.nestjs.com/recipes/passport#implementing-passport-jwt), [OWASP JSON Web Token Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html)

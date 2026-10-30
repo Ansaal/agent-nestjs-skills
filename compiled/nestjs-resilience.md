@@ -56,7 +56,7 @@ async cancel(orderId: string): Promise<OrderEntity> {
 }
 ```
 
-**Correct (commit, then dispatch a call that never rejects):**
+**Correct (commit, then hand the call to a dispatcher that never rejects):**
 
 ```typescript
 async cancel(orderId: string): Promise<OrderEntity> {
@@ -65,12 +65,12 @@ async cancel(orderId: string): Promise<OrderEntity> {
     return manager.findOneByOrFail(OrderEntity, { id: orderId });
   });
   // Committed: the carrier only sees state that exists. The response doesn't wait for it.
-  void this.orderSync.push({ id: order.id, status: order.status });
+  this.orderSync.dispatch({ id: order.id, status: order.status });
   return order;
 }
 ```
 
-`orderSync.push()` runs the call under the `carrier` policy and records a dead letter instead of rejecting (`dlq-record-final-failure`). A crash between commit and dispatch still loses the call; when every committed change must reach the dependency, write an outbox row in the same transaction and dispatch from it. `this.transactions` is the transaction runner from `nestjs-typeorm` (`orm-atomic-writes`); asserting on a dispatch the response doesn't wait for (an awaitable `drain()`, `async-drain-side-effects`) is `nestjs-testing`.
+`orderSync.dispatch()` runs the call under the `carrier` policy, records a dead letter when it still fails, ends in a `.catch` that logs `error` if the dead-letter store fails too, and tracks the job so `drain()` and shutdown wait for it (`dlq-record-final-failure`). `void this.orderSync.push(…)` is not enough: `push()` rejects when the store does, and nothing waits for it. A crash between commit and dispatch still loses the call; when every committed change must reach the dependency, write an outbox row in the same transaction and dispatch from it. `this.transactions` is the transaction runner from `nestjs-typeorm` (`orm-atomic-writes`); tests await `orderSync.drain()` after the response (`async-drain-side-effects` in `nestjs-testing`).
 
 Reference: [NestJS Resilience – Use the same policies inside services](https://docs.nestjs.com/reliability/resilience#use-the-same-policies-inside-services)
 
@@ -80,7 +80,7 @@ Reference: [NestJS Resilience – Use the same policies inside services](https:/
 
 **Impact: CRITICAL** — Decorators on providers silently do nothing; retried POSTs duplicate side effects
 
-`@Retry`, `@Timeout`, `@CircuitBreaker`, `@Bulkhead`, `@Fallback` and `@Resilience` are metadata read by one global interceptor, and interceptors run only around controller routes, GraphQL resolvers, microservice handlers and WebSocket gateways. On a provider method they do nothing, and bootstrap only warns: `Resilience decorators on SyncService.push() have no effect: SyncService is not a controller, resolver or gateway.` Code inside services uses a policy object (`resilience-service-policy`). On HTTP, retries run only for `GET`, `HEAD` and `OPTIONS` (on GraphQL, only queries): a preset's retry is skipped on `POST`, and a bare `@Retry()` there is inactive with `@Retry() on ThingsController.create() is inactive: it only re-runs safe operations (GET, HEAD, OPTIONS, GraphQL queries). If the handler is safe to repeat, use @Retry({ idempotent: true }).` State that a POST is safe to run twice with `@Retry({ idempotent: true })`, and only when the dependency deduplicates the call. Inject `@Signal()` and hand it to every I/O call, so a timed-out attempt cancels its request.
+`@Retry`, `@Timeout`, `@CircuitBreaker`, `@Bulkhead`, `@Fallback` and `@Resilience` are metadata read by one global interceptor, and interceptors run only around controller routes, GraphQL resolvers, microservice handlers and WebSocket gateways. On a provider method they do nothing, and bootstrap only warns: `Resilience decorators on SyncService.push() have no effect: SyncService is not a controller, resolver or gateway.` Code inside services uses a policy object (`resilience-service-policy`). On HTTP, retries run only for `GET`, `HEAD` and `OPTIONS` (on GraphQL, only queries): a preset's retry is skipped on `POST`, and a bare `@Retry()` there is inactive with `@Retry() on ThingsController.create() is inactive: it only re-runs safe operations (GET, HEAD, OPTIONS, GraphQL queries). If the handler is safe to repeat, use @Retry({ idempotent: true }).` State that a POST is safe to run twice with `@Retry({ idempotent: true })`, and only when the dependency deduplicates the call. Inject `@Signal()` and hand it to every I/O call, so a timed-out attempt cancels its request; with `@nestjs/http-client` that is the request's `signal` option (`request-pass-signal` in `nestjs-http-client`).
 
 **Incorrect (decorators on a provider, bare @Retry on a POST, signal dropped):**
 
@@ -140,7 +140,7 @@ Reference: [NestJS Resilience – Retry a POST safely](https://docs.nestjs.com/r
 
 **Impact: CRITICAL** — Unpinned 0.x upgrades, split circuit breakers and retried client errors
 
-`@nestjs/resilience` is pre-1.0 (0.0.3 on 2026-10-29), ESM-only (its export map has only `import`), and its peers are `@nestjs/common` and `@nestjs/core` `^12`; an ESM project setup is `nestjs-setup`. Pin it to an exact version and upgrade deliberately, since any 0.x release may change the API. The module is global: import it once, in the root module, and give each downstream dependency one named preset. A preset's circuit breaker is shared under the preset's name by every route, handler and service that uses the preset, so the whole app learns about one dependency's health from one breaker; options repeated per call site give one dependency several breakers. `retry.attempts` counts the first call: `attempts: 3` is one call plus two retries. By default `retryIf` and `recordIf` skip client errors (a 4xx `HttpException`, or any error with a 4xx `status` or `statusCode`; `408`/`429` from a dependency still count as failures), so a downstream client error must carry its status or it is retried and trips the breaker.
+`@nestjs/resilience` is pre-1.0 (0.0.3 on 2026-10-29), ESM-only (its export map has only `import`), and its peers are `@nestjs/common` and `@nestjs/core` `^12`; an ESM project setup is `nestjs-setup`. Pin it to an exact version and upgrade deliberately, since any 0.x release may change the API. The module is global: import it once, in the root module, and give each downstream dependency one named preset. A preset's circuit breaker is shared under the preset's name by every route, handler and service that uses the preset, so the whole app learns about one dependency's health from one breaker; options repeated per call site give one dependency several breakers. `retry.attempts` counts the first call: `attempts: 3` is one call plus two retries. By default `retryIf` and `recordIf` skip client errors (a 4xx `HttpException`, or any error with a 4xx `status` or `statusCode`; `408`/`429` from a dependency still count as failures), so a downstream client error must carry its status or it is retried and trips the breaker. `@nestjs/http-client` throws `HttpResponseError` with `status` for every non-2xx answer: a `422` from the carrier made 1 request under the 3-attempt preset below, where a `503` made 3. The transport itself is `nestjs-http-client`.
 
 **Incorrect (unpinned, options per call site, status lost):**
 
@@ -195,13 +195,18 @@ export class AppModule {}
 ```
 
 ```typescript
-// carrier/carrier.client.ts
-/** `status` makes a 4xx answer a client error: not retried, not counted by the breaker. */
-export class CarrierError extends Error {
-  constructor(readonly status: number) {
-    super(`The carrier answered with status ${status}`);
-  }
-}
+// carrier/carrier.module.ts imports: the carrier's client (nestjs-http-client)
+HttpClientModule.registerAsync({
+  name: 'carrier',
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    baseUrl: config.getOrThrow<string>('CARRIER_URL'),
+    headers: { 'x-api-key': config.getOrThrow<string>('CARRIER_API_KEY') },
+    timeout: '2s', // per attempt
+    retry: false, // the preset retries; the client's own retry would multiply it
+  }),
+}),
+// A non-2xx answer rejects with HttpResponseError: its `status` keeps a 4xx out of retries and the breaker.
 ```
 
 `defaults` only fills in fields of stages a preset or decorator turns on; it never turns a stage on. Bootstrap fails on an unknown preset name, an invalid duration or number (the `NaN` of an unset env var), or one breaker name configured two ways; build options from config with `ResilienceModule.forRootAsync()`. Budget time end to end: `attempts × timeout + backoff` must fit inside the caller's own timeout. Every breaker needs a `timeout`, because a hanging call is never counted. Breaker state is per process.
@@ -214,7 +219,7 @@ Reference: [NestJS Resilience – Register the module](https://docs.nestjs.com/r
 
 **Impact: CRITICAL** — Retried non-repeatable calls, multiplied retries and work that outlives its timeout
 
-Services, jobs and event consumers get resilience from a policy object: `resilience.preset('<dependency>')` returns the preset as one policy whose breaker is the same instance the `@Resilience('<dependency>')` routes use. Create it once, in the constructor. `execute()` hands the function `{ signal, attempt }`; pass `signal` into the I/O call so a timeout aborts the request, and pass `{ source: 'Class.method' }` so events name the caller. A policy object has no HTTP method to inspect, so the preset's retry **always** applies: run only repeat-safe calls (reads, PUTs keyed by id, creates the dependency deduplicates) under a retrying policy, and give other calls a policy without retry. Retry at one layer: either the entrypoint or the service policy, with retries in SDKs and HTTP clients underneath turned off; 3 attempts at each of 3 layers send up to 27 requests to a struggling dependency.
+Services, jobs and event consumers get resilience from a policy object: `resilience.preset('<dependency>')` returns the preset as one policy whose breaker is the same instance the `@Resilience('<dependency>')` routes use. Create it once, in the constructor. `execute()` hands the function `{ signal, attempt }`; pass `signal` into the I/O call so a timeout aborts the request, and pass `{ source: 'Class.method' }` so events name the caller. A policy object has no HTTP method to inspect, so the preset's retry **always** applies: run only repeat-safe calls (reads, PUTs keyed by id, creates the dependency deduplicates) under a retrying policy, and give other calls a policy without retry. Retry at one layer: either the entrypoint or the service policy, with retries in SDKs and HTTP clients underneath turned off; 3 attempts at each of 3 layers send up to 27 requests to a struggling dependency. `@nestjs/http-client` retries `GET`, `HEAD`, `OPTIONS`, `PUT` and `DELETE` up to 3 times when `retry` is omitted: under the 3-attempt `carrier` preset, one `cheapestQuote()` against a carrier answering `503` sent 9 requests, and 3 once the client was registered with `retry: false`. The HTTP client's own retry stays off; the policy is the retry layer (`client-retry-off` in `nestjs-http-client`).
 
 **Incorrect (policy per call, signal ignored, retried non-repeatable call, stacked retries):**
 
@@ -223,8 +228,13 @@ Services, jobs and event consumers get resilience from a policy object: `resilie
 export class CarrierGateway {
   constructor(private readonly resilience: ResilienceService, private readonly carrier: CarrierClient) {}
 
+  cheapestQuote(orderId: string) {
+    // the carrier's HttpClient is registered without `retry: false`: each of the preset's 3 attempts sends 3 requests
+    return this.resilience.preset('carrier').execute(() => this.carrier.getQuotes(orderId));
+  }
+
   buyLabel(orderId: string) {
-    // retries a call that bills a new label each time; the SDK below also retries 3x
+    // retries a call that bills a new label each time
     return this.resilience.preset('carrier').execute(() => this.carrier.buyLabel(orderId));
   }
 }
@@ -235,7 +245,7 @@ export class CarrierGateway {
 ```typescript
 import { Injectable } from '@nestjs/common';
 import { ResilienceService, type ResiliencePolicy } from '@nestjs/resilience';
-import { CarrierClient } from './carrier.client.js';
+import { CarrierClient } from './carrier.client.js'; // its HttpClient is registered with retry: false
 
 @Injectable()
 export class CarrierGateway {
@@ -271,7 +281,7 @@ export class CarrierGateway {
 }
 ```
 
-`create(options, name)` without a `retry` stage makes one attempt (`defaults` never turn a stage on); `circuitBreaker: 'carrier'` reuses the preset's breaker, so an open breaker rejects this call too with `CircuitOpenError` before the carrier is called. A policy used inside an entrypoint's attempt inherits that attempt's signal. What to do when `execute()` finally rejects is `dlq-record-final-failure`.
+`create(options, name)` without a `retry` stage makes one attempt (`defaults` never turn a stage on); `circuitBreaker: 'carrier'` reuses the preset's breaker, so an open breaker rejects this call too with `CircuitOpenError` before the carrier is called. A policy used inside an entrypoint's attempt inherits that attempt's signal. `CarrierClient` is the carrier's client provider; its methods hand the signal to the request (`request-pass-signal` in `nestjs-http-client`). What to do when `execute()` finally rejects is `dlq-record-final-failure`.
 
 Reference: [NestJS Resilience – Use the same policies inside services](https://docs.nestjs.com/reliability/resilience#use-the-same-policies-inside-services)
 
@@ -336,15 +346,16 @@ export class InMemoryDeadLetterStore extends DeadLetterStore {
 
 ```typescript
 // carrier/order-sync.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+import { type BeforeApplicationShutdown, Injectable, Logger } from '@nestjs/common';
 import { ResilienceService, type ResiliencePolicy } from '@nestjs/resilience';
 import { DeadLetterStore } from '../dead-letter/dead-letter.store.js';
 import { CarrierClient, type OrderSnapshot } from './carrier.client.js';
 
 @Injectable()
-export class OrderSyncService {
+export class OrderSyncService implements BeforeApplicationShutdown {
   private readonly logger = new Logger(OrderSyncService.name);
   private readonly carrierPolicy: ResiliencePolicy;
+  private readonly pending = new Set<Promise<unknown>>();
 
   constructor(
     resilience: ResilienceService,
@@ -354,7 +365,32 @@ export class OrderSyncService {
     this.carrierPolicy = resilience.preset('carrier');
   }
 
-  /** Never rejects: a call that still fails after the preset's retries becomes a dead letter. */
+  /** Fire-and-forget entry point: never rejects, so an unawaited call cannot end the process. */
+  dispatch(order: OrderSnapshot): void {
+    const job = this.push(order)
+      .catch((error: unknown) => {
+        // Only reached when the dead-letter store itself failed: the call is lost, say so once.
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.logger.error('Order sync lost, dead letter not recorded', { orderId: order.id }, err);
+      })
+      .finally(() => this.pending.delete(job));
+    this.pending.add(job);
+  }
+
+  /** Resolves once every dispatched call has settled, including calls dispatched while draining (tests, shutdown). */
+  async drain(): Promise<void> {
+    while (this.pending.size > 0) await Promise.allSettled([...this.pending]);
+  }
+
+  /** `app.close()` waits here, before any dependency shuts down. */
+  beforeApplicationShutdown(): Promise<void> {
+    return this.drain();
+  }
+
+  /**
+   * `false` once a call that still fails after the preset's retries is recorded as a dead letter.
+   * Rejects only when the dead-letter store fails; callers that don't await use `dispatch()`.
+   */
   async push(order: OrderSnapshot): Promise<boolean> {
     let attempts = 0;
     try {
@@ -367,15 +403,16 @@ export class OrderSyncService {
       );
       return true;
     } catch (error) {
-      const lastError = error instanceof Error ? error.message : String(error);
+      const err = error instanceof Error ? error : new Error(String(error));
+      const key = `order-sync:${order.id}`;
       await this.deadLetters.record({
-        key: `order-sync:${order.id}`,
+        key,
         attempts, // 0 when an open breaker rejected the call before it ran
-        lastError,
+        lastError: err.message,
         failedAt: new Date(),
         payload: order,
       });
-      this.logger.error(`Order ${order.id} dead-lettered after ${attempts} attempt(s): ${lastError}`);
+      this.logger.log('Dead letter recorded', { key, attempts }, err);
       return false;
     }
   }
@@ -396,15 +433,15 @@ export class ResilienceLogger implements OnModuleInit {
   onModuleInit() {
     this.resilienceEvents.events$.subscribe((event) => {
       switch (event.type) {
-        case 'retry':
-          this.logger.warn(
-            `${event.source} attempt ${event.attempt} failed, retrying in ${event.delayMs} ms: ${String(event.error)}`,
-          );
+        case 'retry': {
+          const err = event.error instanceof Error ? event.error : new Error(String(event.error));
+          this.logger.warn('Retrying call', { source: event.source, attempt: event.attempt, delayMs: event.delayMs }, err);
           break;
+        }
         case 'circuit-open':
         case 'circuit-half-open':
         case 'circuit-closed':
-          this.logger.warn(`Circuit "${event.policy}" went from ${event.from} to ${event.to}`);
+          this.logger.warn('Circuit state changed', { policy: event.policy, from: event.from, to: event.to });
           break;
       }
     });
@@ -412,7 +449,9 @@ export class ResilienceLogger implements OnModuleInit {
 }
 ```
 
-The error has no attempt count, so the function passed to `execute()` keeps the last `attempt` it saw. Because `push()` never rejects, it is safe to dispatch without awaiting (`resilience-dispatch-after-commit`). A persistent store is a table created by a migration (`nestjs-typeorm`); replay re-runs the same call with the stored `payload`, so it has the same repeat-safety requirement as the retry.
+The error has no attempt count, so the function passed to `execute()` keeps the last `attempt` it saw. Against a carrier answering `503`, with its `@nestjs/http-client` client registered `retry: false` (`nestjs-http-client`), `dispatch()` sent 3 `PUT`s, logged two `Retrying call` warnings and then `{"level":"log",…,"message":"Dead letter recorded","context":"OrderSyncService","error":{"name":"HttpResponseError","message":"PUT http://127.0.0.1:59914/orders/ord_1 failed with 503 Service Unavailable","stack":"…","method":"PUT","status":503,"statusText":"Service Unavailable"},"params":{"key":"order-sync:ord_1","attempts":3}}`. The error goes in as the third argument, never as a field (`content-errors-as-objects` in `nestjs-logging`). The client's error messages mask query values and leave out the response body, so `lastError` is safe to store. A retry is `warn` (degraded, handled), the dead letter `log` (an event an operator acts on, small), the lost call `error` (nobody will retry it); levels are `nestjs-logging`.
+
+The dead-letter store is one more dependency and can fail too: then `record()` rejects inside the `catch`, and `push()` rejects with the store's error. Awaiting callers see it; an unawaited `void this.orderSync.push(order)` turns it into an unhandled rejection, which ends the process. `dispatch()` is the one fire-and-forget entry point: the terminal `.catch` comes before `.finally`, so the job always settles and leaves `pending`. With a store whose `record()` threw `dead-letter table locked`, `dispatch()` then `drain()` resolved after 3 attempts, an `unhandledRejection` listener recorded nothing, and the log had `error` `Order sync lost, dead letter not recorded` with `params: { orderId: 'ord_2' }` and the store's error attached. With a 300 ms carrier call in flight, `app.close()` took 302 ms and the call completed; without `beforeApplicationShutdown` it returned after 1 ms with the call unfinished. Tests await the same `drain()` after a `202` (`async-drain-side-effects` in `nestjs-testing`). A persistent store is a table created by a migration and written through `TransactionRunner.run()` (`nestjs-typeorm`); when losing the call is not acceptable, write an outbox row in the business transaction instead (`resilience-dispatch-after-commit`). Replay re-runs the same call with the stored `payload`, so it has the same repeat-safety requirement as the retry.
 
 Reference: [NestJS Resilience – Observe breaker transitions](https://docs.nestjs.com/reliability/resilience#observe-breaker-transitions)
 
@@ -540,8 +579,8 @@ async applyStatusEvent(event: OrderStatusEvent): Promise<{ status: 'processed' |
     if (isUniqueViolation(error)) return { status: 'duplicate' };
     throw error;
   }
-  // Committed. The contract answers without waiting for the carrier; push() records its own failures.
-  void this.orderSync.push({ id: order.id, status: order.status });
+  // Committed. The contract answers without waiting for the carrier; dispatch() owns every failure.
+  this.orderSync.dispatch({ id: order.id, status: order.status });
   return { status: 'processed' };
 }
 ```
@@ -562,4 +601,4 @@ Reference: [NestJS Idempotency keys – what a retry gets](https://docs.nestjs.c
 
 ---
 
-*Generated by build-agents.ts on 2026-10-29*
+*Generated by build-agents.ts on 2026-10-30*

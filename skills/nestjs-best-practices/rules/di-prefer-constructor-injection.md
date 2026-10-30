@@ -48,39 +48,22 @@ export class UsersService {
   }
 }
 
-// Testing is straightforward
-describe('UsersService', () => {
-  let service: UsersService;
-  let mockRepo: Mocked<UserRepository>; // import type { Mocked } from 'vitest'
-
-  beforeEach(() => {
-    mockRepo = {
-      find: vi.fn(),
-      save: vi.fn(),
-    } as unknown as Mocked<UserRepository>;
-
-    service = new UsersService(mockRepo, { dbUrl: 'test' });
-  });
-
-  it('should find all users', async () => {
-    mockRepo.find.mockResolvedValue([{ id: '1', name: 'Test' }]);
-    const result = await service.findAll();
-    expect(result).toHaveLength(1);
-  });
-});
-
 // Only use property injection for optional dependencies
 @Injectable()
-export class LoggingService {
+export class EventRecorder {
+  private readonly logger = new Logger(EventRecorder.name);
+
   @Optional()
   @Inject('ANALYTICS')
   private analytics?: AnalyticsService;
 
-  log(message: string) {
-    console.log(message);
-    this.analytics?.track('log', message); // Optional enhancement
+  record(event: string) {
+    this.logger.debug('Event recorded', { event });
+    this.analytics?.track(event); // Optional enhancement
   }
 }
 ```
+
+Every dependency the constructor lists is one `useMocker()` can supply, so a unit test compiles `Test.createTestingModule({ providers: [UsersService] }).useMocker(autoMock)` and reads typed mocks with `vi.mocked(moduleRef.get(UserRepository))`; the `'CONFIG'` string token gets a specific double. How to write those tests is owned by `nestjs-testing` (`unit-automock-dependencies`, `unit-specific-doubles`).
 
 Reference: [NestJS Providers](https://docs.nestjs.com/providers)

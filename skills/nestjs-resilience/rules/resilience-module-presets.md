@@ -7,7 +7,7 @@ tags: resilience, retry, circuit-breaker, configuration
 
 ## Register ResilienceModule Once, With One Preset per Dependency
 
-`@nestjs/resilience` is pre-1.0 (0.0.3 on 2026-10-29), ESM-only (its export map has only `import`), and its peers are `@nestjs/common` and `@nestjs/core` `^12`; an ESM project setup is `nestjs-setup`. Pin it to an exact version and upgrade deliberately, since any 0.x release may change the API. The module is global: import it once, in the root module, and give each downstream dependency one named preset. A preset's circuit breaker is shared under the preset's name by every route, handler and service that uses the preset, so the whole app learns about one dependency's health from one breaker; options repeated per call site give one dependency several breakers. `retry.attempts` counts the first call: `attempts: 3` is one call plus two retries. By default `retryIf` and `recordIf` skip client errors (a 4xx `HttpException`, or any error with a 4xx `status` or `statusCode`; `408`/`429` from a dependency still count as failures), so a downstream client error must carry its status or it is retried and trips the breaker.
+`@nestjs/resilience` is pre-1.0 (0.0.3 on 2026-10-29), ESM-only (its export map has only `import`), and its peers are `@nestjs/common` and `@nestjs/core` `^12`; an ESM project setup is `nestjs-setup`. Pin it to an exact version and upgrade deliberately, since any 0.x release may change the API. The module is global: import it once, in the root module, and give each downstream dependency one named preset. A preset's circuit breaker is shared under the preset's name by every route, handler and service that uses the preset, so the whole app learns about one dependency's health from one breaker; options repeated per call site give one dependency several breakers. `retry.attempts` counts the first call: `attempts: 3` is one call plus two retries. By default `retryIf` and `recordIf` skip client errors (a 4xx `HttpException`, or any error with a 4xx `status` or `statusCode`; `408`/`429` from a dependency still count as failures), so a downstream client error must carry its status or it is retried and trips the breaker. `@nestjs/http-client` throws `HttpResponseError` with `status` for every non-2xx answer: a `422` from the carrier made 1 request under the 3-attempt preset below, where a `503` made 3. The transport itself is `nestjs-http-client`.
 
 **Incorrect (unpinned, options per call site, status lost):**
 
@@ -62,13 +62,18 @@ export class AppModule {}
 ```
 
 ```typescript
-// carrier/carrier.client.ts
-/** `status` makes a 4xx answer a client error: not retried, not counted by the breaker. */
-export class CarrierError extends Error {
-  constructor(readonly status: number) {
-    super(`The carrier answered with status ${status}`);
-  }
-}
+// carrier/carrier.module.ts imports: the carrier's client (nestjs-http-client)
+HttpClientModule.registerAsync({
+  name: 'carrier',
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    baseUrl: config.getOrThrow<string>('CARRIER_URL'),
+    headers: { 'x-api-key': config.getOrThrow<string>('CARRIER_API_KEY') },
+    timeout: '2s', // per attempt
+    retry: false, // the preset retries; the client's own retry would multiply it
+  }),
+}),
+// A non-2xx answer rejects with HttpResponseError: its `status` keeps a 4xx out of retries and the breaker.
 ```
 
 `defaults` only fills in fields of stages a preset or decorator turns on; it never turns a stage on. Bootstrap fails on an unknown preset name, an invalid duration or number (the `NaN` of an unset env var), or one breaker name configured two ways; build options from config with `ResilienceModule.forRootAsync()`. Budget time end to end: `attempts × timeout + backoff` must fit inside the caller's own timeout. Every breaker needs a `timeout`, because a hanging call is never counted. Breaker state is per process.
